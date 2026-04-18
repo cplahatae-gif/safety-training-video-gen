@@ -239,9 +239,10 @@ from pydantic import BaseModel
 
 class SceneStatus(str, Enum):
     pending = "pending"
+    audio_ready = "audio_ready"
     image_ready = "image_ready"
     clip_ready = "clip_ready"
-    audio_ready = "audio_ready"
+    merged_ready = "merged_ready"   # per-scene merge done; final concat pending
     assembled = "assembled"
     skipped = "skipped"
 
@@ -703,6 +704,10 @@ def _gemini_structure(raw_text: str) -> dict:
     for attempt in range(config.MAX_RETRY + 1):
         try:
             response = model.generate_content(prompt)
+            # Guard: safety block or empty response raises before parsing
+            if not response.candidates or not response.candidates[0].content.parts:
+                finish = getattr(response.candidates[0], "finish_reason", "unknown") if response.candidates else "no_candidates"
+                raise ParseError(f"Gemini returned no content (finish_reason={finish})")
             text = response.text.strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
@@ -830,6 +835,9 @@ def generate_script(sop: dict, duration: int) -> list[dict]:
     for attempt in range(config.MAX_RETRY + 1):
         try:
             response = model.generate_content(user_prompt)
+            if not response.candidates or not response.candidates[0].content.parts:
+                finish = getattr(response.candidates[0], "finish_reason", "unknown") if response.candidates else "no_candidates"
+                raise RuntimeError(f"Gemini returned no content (finish_reason={finish})")
             text = response.text.strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
@@ -897,8 +905,8 @@ def test_split_scenes_creates_manifest_and_audio(tmp_path):
     workspace.mkdir()
 
     with patch("pipeline.scene_splitter.synthesize") as mock_tts:
-        # S01: 5 sec audio → duration 6 → no split
-        # S02: 9 sec audio → duration 10 → split into S02a (8s) + S02b (2s)
+        # S01: 5.0s → ceil = 5 → no split
+        # S02: 9.2s → ceil = 10 → split into S02a (8s) + S02b (2s) — 2 chunks
         mock_tts.side_effect = [
             (b"AUDIO01", 5.0),
             (b"AUDIO02", 9.2),
@@ -923,8 +931,13 @@ def test_split_scenes_creates_manifest_and_audio(tmp_path):
     # provider + voice frozen
     assert manifest.tts_provider == "google"
     assert manifest.tts_voice is not None
-    # audio_split called once for S02
-    mock_split.assert_called_once()
+    # _split_audio_file called TWICE: once for S02a (length=8), once for S02b (length=None)
+    assert mock_split.call_count == 2
+    calls = mock_split.call_args_list
+    assert calls[0].kwargs["start"] == 0
+    assert calls[0].kwargs["length"] == 8
+    assert calls[1].kwargs["start"] == 8
+    assert calls[1].kwargs["length"] is None
 
 
 def test_split_scenes_no_subsplit_needed(tmp_path):
@@ -943,7 +956,7 @@ def test_split_scenes_no_subsplit_needed(tmp_path):
         )
 
     assert len(manifest.scenes) == 1
-    assert manifest.scenes[0].duration_sec == math.ceil(5.0) + 1
+    assert manifest.scenes[0].duration_sec == math.ceil(5.0)  # no +1 padding
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1005,23 +1018,28 @@ def split_scenes(
             tts_provider = provider
             tts_voice = voice
 
-        duration_sec = math.ceil(dur_sec) + 1
+        duration_sec = math.ceil(dur_sec)  # no +1 padding — avoids spurious splits
 
         if duration_sec <= 8:
             scenes.append(_make_scene(raw, scene_id, duration_sec))
         else:
-            # Split into sub-scenes
-            sub_a_id = f"{scene_id}a"
-            sub_b_id = f"{scene_id}b"
-            remainder = duration_sec - 8
-
-            sub_a_audio = audio_dir / f"{sub_a_id}.mp3"
-            sub_b_audio = audio_dir / f"{sub_b_id}.mp3"
-            _split_audio_file(audio_path, sub_a_audio, start=0, length=8)
-            _split_audio_file(audio_path, sub_b_audio, start=8, length=None)
-
-            scenes.append(_make_scene(raw, sub_a_id, 8))
-            scenes.append(_make_scene(raw, sub_b_id, remainder))
+            # N-way split: every chunk is <= 8s; suffix = 'a', 'b', 'c', ...
+            offset = 0
+            suffix_idx = 0
+            while offset < duration_sec:
+                chunk_dur = min(8, duration_sec - offset)
+                suffix = chr(ord('a') + suffix_idx)
+                sub_id = f"{scene_id}{suffix}"
+                sub_audio = audio_dir / f"{sub_id}.mp3"
+                is_last = (offset + chunk_dur >= duration_sec)
+                _split_audio_file(
+                    audio_path, sub_audio,
+                    start=offset,
+                    length=None if is_last else chunk_dur,
+                )
+                scenes.append(_make_scene(raw, sub_id, chunk_dur))
+                offset += chunk_dur
+                suffix_idx += 1
 
     manifest = SceneManifest(
         sop_title=sop_title,
@@ -1185,9 +1203,11 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
     for scene in manifest.scenes:
         if scene.status == SceneStatus.skipped:
             continue
-        if scene.status == SceneStatus.image_ready:
-            console.print(f"[dim]Skip {scene.scene_id} — image already exists[/dim]")
+        if scene.status in (SceneStatus.image_ready, SceneStatus.clip_ready,
+                             SceneStatus.merged_ready, SceneStatus.assembled):
+            console.print(f"[dim]Skip {scene.scene_id} — already at {scene.status}[/dim]")
             continue
+        # Only process audio_ready (and pending if explicitly added to workspace)
 
         out_path = images_dir / f"{scene.scene_id}.png"
         success = _generate_with_retry(scene.image_prompt, out_path, model)
@@ -1545,9 +1565,17 @@ class AssemblyError(Exception):
 
 
 def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path:
-    """Merge clips + audio per scene, then concatenate into final MP4."""
-    # Only clip_ready scenes have both a clip AND audio — audio_ready scenes lack clips
-    assemblable = [s for s in manifest.scenes if s.status == SceneStatus.clip_ready]
+    """Merge clips + audio per scene, then concatenate into final MP4.
+
+    Resume-safe: per-scene merge (clip_ready→merged_ready) is checkpointed
+    separately from final concat (merged_ready→assembled). On rerun, already-merged
+    scenes are skipped.
+    """
+    # Include clip_ready (needs merge) and merged_ready (needs concat only) scenes
+    assemblable = [
+        s for s in manifest.scenes
+        if s.status in (SceneStatus.clip_ready, SceneStatus.merged_ready)
+    ]
 
     if not assemblable:
         raise AssemblyError("No assemblable scenes — all scenes were skipped or pending.")
@@ -1557,8 +1585,10 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
     tmp_dir = workspace / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pre-assembly integrity check
+    # Pre-assembly integrity check for clip_ready scenes only
     for scene in assemblable:
+        if scene.status != SceneStatus.clip_ready:
+            continue
         clip_path = clips_dir / f"{scene.scene_id}.mp4"
         audio_path = audio_dir / f"{scene.scene_id}.mp3"
         if not clip_path.exists():
@@ -1566,15 +1596,16 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
         if not audio_path.exists():
             raise AssemblyError(f"missing audio: {audio_path}")
 
-    merged_paths: list[Path] = []
-
+    # Step 1+2: Normalize + merge per scene (skip if already merged)
     for scene in assemblable:
+        merged_path = tmp_dir / f"{scene.scene_id}_merged.mp4"
+        if merged_path.exists():
+            continue  # resume: already merged in a prior run
+
         clip_path = clips_dir / f"{scene.scene_id}.mp4"
         audio_path = audio_dir / f"{scene.scene_id}.mp3"
         norm_path = tmp_dir / f"{scene.scene_id}_norm.mp4"
-        merged_path = tmp_dir / f"{scene.scene_id}_merged.mp4"
 
-        # Step 1: Normalize
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", str(clip_path),
@@ -1585,8 +1616,6 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
             ],
             check=True, capture_output=True,
         )
-
-        # Step 2: Merge clip + audio with explicit duration
         audio_dur = _audio_duration(audio_path)
         subprocess.run(
             [
@@ -1599,13 +1628,15 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
             ],
             check=True, capture_output=True,
         )
-
-        scene.status = SceneStatus.assembled
-        merged_paths.append(merged_path)
-        # Persist after each scene (C2: assembler must save manifest)
+        # Checkpoint: mark merged_ready, persist before concat
+        scene.status = SceneStatus.merged_ready
         manifest.save(workspace)
 
-    # Step 3: Concatenate via concat demuxer
+    # Step 3: Concatenate all merged files in manifest order
+    merged_paths = [
+        tmp_dir / f"{s.scene_id}_merged.mp4"
+        for s in assemblable
+    ]
     concat_list = tmp_dir / "concat.txt"
     concat_list.write_text(
         "\n".join(f"file '{p.resolve()}'" for p in merged_paths),
@@ -1623,6 +1654,11 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
         ],
         check=True, capture_output=True,
     )
+
+    # Only mark assembled after concat succeeds
+    for scene in assemblable:
+        scene.status = SceneStatus.assembled
+    manifest.save(workspace)
 
     console.print(f"[green]Output: {output_path}[/green]")
     return output_path
