@@ -1,0 +1,8 @@
+.env
+*.json
+!docs/**/*.json
+workspace/
+output/
+__pycache__/
+*.pyc
+.venv/
