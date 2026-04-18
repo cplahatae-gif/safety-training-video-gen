@@ -127,11 +127,14 @@ python main.py --sop path/to/sop.docx --dry-run
   "sop_title": "고소작업차 운용 표준 안전작업지침",
   "total_duration_sec": 180,
   "video_style": "hybrid",
+  "tts_provider": "google",
+  "tts_voice": "ko-KR-Wavenet-B",
   "scenes": [
     {
       "scene_id": "S01",
       "act": "hook",
       "duration_sec": 8,
+      "status": "pending",
       "narration_ko": "아웃리거를 완전히 전개하지 않으면 이런 일이 생깁니다.",
       "image_prompt": "Korean construction site, aerial work platform truck, worker in Sampyo navy uniform with reflective stripes, white hard hat with Sampyo logo, morning light, wide shot",
       "motion_prompt": "truck slowly tilts to one side, worker grabs handrail, slow motion",
@@ -141,6 +144,9 @@ python main.py --sop path/to/sop.docx --dry-run
     }
   ]
 }
+```
+
+Scene `status` lifecycle: `pending` → `image_ready` → `clip_ready` → `audio_ready` → `assembled`. On 2× generation failure: `skipped`. Stage 7 only assembles scenes with `clip_ready` AND `audio_ready`.
 ```
 
 ---
@@ -163,10 +169,10 @@ python main.py --sop path/to/sop.docx --dry-run
 
 ### Stage 3: Scene Splitter (`scene_splitter.py`)
 - **Input:** Script dict
-- **Output:** `workspace/<run_id>/manifest.json`
-- **Logic:** TTS duration-first approach — call `tts.synthesize()` per scene first, measure audio duration, set `duration_sec = ceil(audio_duration) + 1`
-- **8-second limit handling:** If `duration_sec > 8`, split into sub-scenes: `[S03a (8s), S03b (remainder)]`. Same image, motion prompt continues. Kling called once per sub-scene.
-- **tts.py interface:** Must expose `synthesize(text) -> (audio_bytes, duration_sec)` callable from both Stage 3 and standalone Stage 6
+- **Output:** `workspace/<run_id>/manifest.json`, `workspace/<run_id>/audio/S<N>.mp3`
+- **Logic:** TTS duration-first approach — call `tts.synthesize()` per scene, **immediately write audio bytes to `audio/S<N>.mp3`**, measure duration, set `duration_sec = ceil(audio_duration) + 1`. Provider and voice are frozen after the first successful synthesis call and stored in `manifest.json` as `tts_provider` and `tts_voice` fields.
+- **8-second limit handling:** If `duration_sec > 8`, split into sub-scenes: `[S03a (8s), S03b (remainder)]`. Same image, motion prompt continues. Kling called once per sub-scene. For sub-scenes, the narration audio is also split: `S03a` gets `ffmpeg -i audio.mp3 -t 8 audio_S03a.mp3`, `S03b` gets `ffmpeg -i audio.mp3 -ss 8 audio_S03b.mp3`.
+- **tts.py interface:** Must expose `synthesize(text, provider, voice) -> (audio_bytes, duration_sec)` — provider/voice are passed in (not auto-selected) so Stage 3 controls the freeze.
 
 ### Stage 4: Image Generator (`image_gen.py`)
 - **Input:** `manifest.json`
@@ -184,21 +190,23 @@ python main.py --sop path/to/sop.docx --dry-run
 - **Cost gate:** Warn if estimated cost > $30 before proceeding
 
 ### Stage 6: TTS (`tts.py`)
-- **Input:** `narration_ko` per scene
+- **Input:** `manifest.json` (reads `tts_provider`, `tts_voice` frozen in Stage 3)
 - **Output:** `workspace/<run_id>/audio/S<N>.mp3`
+- **Logic:** For each scene, check if `audio/S<N>.mp3` already exists. If yes, skip (Stage 3 already synthesized it). Only synthesize for scenes that are missing audio (e.g., when `--stage 6` is run standalone after partial failure). Uses the frozen `tts_provider` and `tts_voice` from manifest — no provider auto-selection at this stage.
 - **Primary:** Google Cloud TTS WaveNet (language: `ko-KR`, voice: `ko-KR-Wavenet-A/B/C`)
-- **Fallback:** ElevenLabs Multilingual v2 if Google Cloud TTS unavailable
+- **Fallback:** ElevenLabs Multilingual v2 — only used if Stage 3 originally fell back (recorded in `tts_provider`)
 - **Cost:** WaveNet ~$0.016/1K chars (월 100만자 무료 → 3분 영상 약 1,500자 기준 약 666편까지 무료)
-- **Note:** Called during Stage 3 to determine scene durations
 
 ### Stage 7: Assembler (`assembler.py`)
-- **Input:** `clips/S<N>.mp4` + `audio/S<N>.mp3`
+- **Input:** `manifest.json` + `clips/S<N>.mp4` + `audio/S<N>.mp3`
 - **Output:** `output/<sop_title>_<timestamp>.mp4`
 - **Tool:** FFmpeg (must be in PATH)
+- **Manifest scene status:** Each scene in `manifest.json` carries a `status` field updated by prior stages: `pending` → `image_ready` → `clip_ready` → `audio_ready` → `assembled` / `skipped` (on 2× failure). Stage 7 only processes scenes with status `clip_ready` AND `audio_ready`. Skipped scenes are excluded from the concat list.
+- **Pre-assembly integrity check:** Before starting, verify that for every non-skipped scene, both `clips/S<N>.mp4` and `audio/S<N>.mp3` exist. Abort with `AssemblyError` if any pair is incomplete.
 - **Steps:**
   1. Normalize each clip: `ffmpeg -i clip.mp4 -vf scale=1920:1080 -r 24 -c:v libx264 normalized.mp4`
   2. Merge clip + audio with explicit duration: `ffmpeg -i normalized.mp4 -i audio.mp3 -t {audio_duration} merged.mp4` (avoid `-shortest` — clips may be shorter than audio for sub-scenes)
-  3. Concatenate all merged clips via concat demuxer
+  3. Concatenate only validated (non-skipped) merged clips via concat demuxer
   4. Apply fade-in/fade-out between scenes (0.3s crossfade)
 
 ---
