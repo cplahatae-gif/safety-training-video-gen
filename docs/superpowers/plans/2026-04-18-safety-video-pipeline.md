@@ -4,9 +4,9 @@
 
 **Goal:** Build a 7-stage CLI pipeline that converts SOP DOCX/PDF files into finished 1080p MP4 safety training videos, with per-scene TTS narration, FLUX keyframes, and Kling motion clips.
 
-**Architecture:** Each stage is an independent Python module in `pipeline/`. Stages communicate via `workspace/<run_id>/` directory (manifest.json as shared state, images/, clips/, audio/ for artifacts). `manifest.json` carries a `status` field per scene so partial reruns and partial failures are handled gracefully. TTS is synthesized exactly once (Stage 3) and reused by Stage 6/7.
+**Architecture:** Each stage is an independent Python module in `pipeline/`. Stages communicate via `workspace/<run_id>/` directory (manifest.json as shared state, images/, clips/, audio/ for artifacts). `manifest.json` carries a `status` field per scene so partial reruns and partial failures are handled gracefully. TTS is synthesized in Stage 3; Stage 6 fills gaps for any scenes missing audio (e.g., sub-scene splits or partial re-runs).
 
-**Tech Stack:** Python 3.12, uv, anthropic>=0.90.0, fal-client, google-cloud-texttospeech, python-docx, pdfplumber, pydantic>=2.0, python-ffmpeg, python-dotenv, rich, pytest
+**Tech Stack:** Python 3.12, uv, google-generativeai>=0.8.0, fal-client, google-cloud-texttospeech, python-docx, pdfplumber, pydantic>=2.0, python-ffmpeg, python-dotenv, rich, pytest
 
 ---
 
@@ -20,12 +20,12 @@
 | `main.py` | CLI entrypoint (argparse) |
 | `models/__init__.py` | Package init |
 | `models/scene_manifest.py` | Pydantic: `SceneManifest`, `Scene`, `SceneStatus`, `SopJson` |
-| `prompts/script_prompt.py` | Claude system + user prompt templates for script generation |
+| `prompts/script_prompt.py` | Gemini system + user prompt templates for script generation |
 | `prompts/scene_prompt.py` | Character prefix + image/motion prompt builder |
 | `pipeline/__init__.py` | Package init |
 | `pipeline/tts.py` | `synthesize(text, provider, voice, output_path) -> (bytes, float)` |
 | `pipeline/sop_parser.py` | `parse_sop(path) -> dict` — DOCX/PDF → SOP JSON |
-| `pipeline/script_gen.py` | `generate_script(sop, duration) -> list[dict]` — Claude → scenes |
+| `pipeline/script_gen.py` | `generate_script(sop, duration) -> list[dict]` — Gemini → scenes |
 | `pipeline/scene_splitter.py` | `split_scenes(script, workspace, run_id) -> SceneManifest` — TTS + manifest |
 | `pipeline/image_gen.py` | `generate_images(manifest, workspace) -> SceneManifest` — FLUX |
 | `pipeline/video_gen.py` | `generate_videos(manifest, workspace) -> SceneManifest` — Kling |
@@ -33,8 +33,8 @@
 | `tests/conftest.py` | Shared fixtures |
 | `tests/test_models.py` | Pydantic model validation |
 | `tests/test_tts.py` | TTS synthesize + file write |
-| `tests/test_sop_parser.py` | DOCX/PDF parse + Claude structuring |
-| `tests/test_script_gen.py` | Script generation via Claude |
+| `tests/test_sop_parser.py` | DOCX/PDF parse + Gemini structuring |
+| `tests/test_script_gen.py` | Script generation via Gemini |
 | `tests/test_scene_splitter.py` | Scene splitting, TTS call, sub-scene logic |
 | `tests/test_image_gen.py` | Image generation with fal mocking |
 | `tests/test_video_gen.py` | Video generation with fal mocking |
@@ -69,7 +69,7 @@ Expected: `pyproject.toml` and `.python-version` created.
 - [ ] **Step 2: Add all dependencies**
 
 ```bash
-uv add anthropic pydantic python-dotenv rich
+uv add google-generativeai pydantic python-dotenv rich
 uv add python-docx pdfplumber
 uv add fal-client
 uv add google-cloud-texttospeech
@@ -89,7 +89,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 FAL_KEY: str = os.getenv("FAL_KEY", "")
 GOOGLE_APPLICATION_CREDENTIALS: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY", "")
@@ -101,13 +101,13 @@ DEFAULT_DURATION: int = int(os.getenv("DEFAULT_DURATION", "180"))
 MAX_RETRY: int = int(os.getenv("MAX_RETRY", "1"))
 WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", "./workspace"))
 OUTPUT_DIR: Path = Path(os.getenv("OUTPUT_DIR", "./output"))
-CLAUDE_MODEL: str = "claude-sonnet-4-6"
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 ```
 
 - [ ] **Step 4: Write `.env.example`**
 
 ```
-ANTHROPIC_API_KEY=
+GEMINI_API_KEY=
 FAL_KEY=
 GOOGLE_APPLICATION_CREDENTIALS=path/to/service-account.json
 ELEVENLABS_API_KEY=
@@ -266,6 +266,12 @@ class SceneManifest(BaseModel):
     tts_provider: Optional[str] = None
     tts_voice: Optional[str] = None
     scenes: list[Scene]
+
+    def save(self, workspace: Path) -> None:
+        """Persist manifest.json to workspace directory."""
+        (workspace / "manifest.json").write_text(
+            self.model_dump_json(indent=2), encoding="utf-8"
+        )
 
 
 class Hazard(BaseModel):
@@ -577,7 +583,7 @@ def test_parse_docx_returns_sop_json(tmp_path, sample_sop):
     fake_docx.write_bytes(b"PK\x03\x04")  # minimal zip magic bytes
 
     with patch("pipeline.sop_parser._extract_text_docx", return_value="SOP 원문 텍스트"), \
-         patch("pipeline.sop_parser._claude_structure", return_value=EXPECTED_SOP):
+         patch("pipeline.sop_parser._gemini_structure", return_value=EXPECTED_SOP):
         result = parse_sop(fake_docx, run_workspace=tmp_path)
 
     assert result["sop_title"] == "테스트 SOP"
@@ -589,7 +595,7 @@ def test_parse_pdf_returns_sop_json(tmp_path):
     fake_pdf.write_bytes(b"%PDF-1.4")
 
     with patch("pipeline.sop_parser._extract_text_pdf", return_value="SOP 원문 텍스트"), \
-         patch("pipeline.sop_parser._claude_structure", return_value=EXPECTED_SOP):
+         patch("pipeline.sop_parser._gemini_structure", return_value=EXPECTED_SOP):
         result = parse_sop(fake_pdf, run_workspace=tmp_path)
 
     assert result["sop_title"] == "테스트 SOP"
@@ -618,7 +624,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import anthropic
 import pdfplumber
 from docx import Document
 
@@ -644,7 +649,7 @@ def parse_sop(sop_path: Path, run_workspace: Path) -> dict:
     if not text.strip():
         raise ParseError(f"Could not extract text from {sop_path.name}")
 
-    sop_data = _claude_structure(text)
+    sop_data = _gemini_structure(text)
 
     try:
         SopJson.model_validate(sop_data)
@@ -673,8 +678,13 @@ def _extract_text_pdf(path: Path) -> str:
     return "\n".join(lines)
 
 
-def _claude_structure(raw_text: str) -> dict:
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+def _gemini_structure(raw_text: str) -> dict:
+    import google.generativeai as genai
+    genai.configure(api_key=config.GEMINI_API_KEY)
+    model = genai.GenerativeModel(
+        model_name=config.GEMINI_MODEL,
+        system_instruction=SYSTEM_PROMPT,
+    )
     prompt = f"""다음 SOP 원문을 분석하여 JSON으로 구조화하세요.
 
 원문:
@@ -692,17 +702,16 @@ def _claude_structure(raw_text: str) -> dict:
 
     for attempt in range(config.MAX_RETRY + 1):
         try:
-            response = client.messages.create(
-                model=config.CLAUDE_MODEL,
-                max_tokens=2048,
-                system=[{"type": "text", "text": SYSTEM_PROMPT,
-                          "cache_control": {"type": "ephemeral"}}],
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return json.loads(response.content[0].text)
+            response = model.generate_content(prompt)
+            text = response.text.strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            return json.loads(text)
         except Exception as exc:
             if attempt == config.MAX_RETRY:
-                raise ParseError(f"Claude API failed after {config.MAX_RETRY + 1} attempts: {exc}") from exc
+                raise ParseError(f"Gemini API failed after {config.MAX_RETRY + 1} attempts: {exc}") from exc
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -735,6 +744,7 @@ git commit -m "feat: SOP parser — DOCX/PDF text extraction + Claude structurin
 import json
 from unittest.mock import MagicMock, patch
 import pytest
+import google.generativeai as genai
 from pipeline.script_gen import generate_script
 
 FAKE_SCENES = [
@@ -749,12 +759,12 @@ FAKE_SCENES = [
 
 
 def test_generate_script_3min_returns_scene_list(sample_sop):
-    with patch("pipeline.script_gen.anthropic.Anthropic") as mock_cls:
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = MagicMock(
-            content=[MagicMock(text=json.dumps(FAKE_SCENES))]
-        )
-        mock_cls.return_value = mock_client
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(FAKE_SCENES)
+    with patch("pipeline.script_gen.genai.GenerativeModel") as mock_model_cls:
+        mock_model = MagicMock()
+        mock_model.generate_content.return_value = mock_response
+        mock_model_cls.return_value = mock_model
 
         scenes = generate_script(sop=sample_sop, duration=180)
 
@@ -766,17 +776,17 @@ def test_generate_script_3min_returns_scene_list(sample_sop):
 
 
 def test_generate_script_30sec_uses_shortform_template(sample_sop):
-    with patch("pipeline.script_gen.anthropic.Anthropic") as mock_cls:
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = MagicMock(
-            content=[MagicMock(text=json.dumps(FAKE_SCENES))]
-        )
-        mock_cls.return_value = mock_client
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(FAKE_SCENES)
+    with patch("pipeline.script_gen.genai.GenerativeModel") as mock_model_cls:
+        mock_model = MagicMock()
+        mock_model.generate_content.return_value = mock_response
+        mock_model_cls.return_value = mock_model
 
         scenes = generate_script(sop=sample_sop, duration=30)
-        call_args = mock_client.messages.create.call_args
+        call_args = mock_model.generate_content.call_args
 
-    user_content = call_args[1]["messages"][0]["content"]
+    user_content = call_args[0][0]
     assert "30초" in user_content or "shortform" in user_content.lower()
 ```
 
@@ -794,18 +804,21 @@ Expected: `ImportError: No module named 'pipeline.script_gen'`
 from __future__ import annotations
 import json
 
-import anthropic
+import google.generativeai as genai
 
 import config
 from prompts.script_prompt import SYSTEM_PROMPT, THREE_MIN_TEMPLATE, SHORTFORM_TEMPLATE
 
 
 def generate_script(sop: dict, duration: int) -> list[dict]:
-    """Call Claude to generate a list of scene dicts from SOP JSON."""
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    """Call Gemini to generate a list of scene dicts from SOP JSON."""
+    genai.configure(api_key=config.GEMINI_API_KEY)
+    model = genai.GenerativeModel(
+        model_name=config.GEMINI_MODEL,
+        system_instruction=SYSTEM_PROMPT,
+    )
 
     if duration <= 30:
-        scene_count = 4
         user_prompt = SHORTFORM_TEMPLATE.format(sop_json=json.dumps(sop, ensure_ascii=False))
     else:
         scene_count = duration // 8
@@ -816,15 +829,8 @@ def generate_script(sop: dict, duration: int) -> list[dict]:
 
     for attempt in range(config.MAX_RETRY + 1):
         try:
-            response = client.messages.create(
-                model=config.CLAUDE_MODEL,
-                max_tokens=4096,
-                system=[{"type": "text", "text": SYSTEM_PROMPT,
-                          "cache_control": {"type": "ephemeral"}}],
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            text = response.content[0].text.strip()
-            # Strip markdown code fences if present
+            response = model.generate_content(user_prompt)
+            text = response.text.strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
                 if text.startswith("json"):
@@ -847,7 +853,7 @@ Expected: 2 tests PASSED.
 
 ```bash
 git add pipeline/script_gen.py tests/test_script_gen.py
-git commit -m "feat: script generator — Claude 3-act structure, prompt caching"
+git commit -m "feat: script generator — Gemini 3-act structure"
 ```
 
 ---
@@ -1165,11 +1171,6 @@ from models.scene_manifest import SceneManifest, SceneStatus
 
 console = Console()
 
-CHARACTER_PREFIX = (
-    "Korean male worker, Sampyo navy blue uniform, reflective yellow stripes, "
-    "white hard hat with Sampyo logo, "
-)
-
 
 def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
     images_dir = workspace / "images"
@@ -1196,7 +1197,7 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
             scene.status = SceneStatus.skipped
             console.print(f"[yellow]Warning: image gen failed for {scene.scene_id}, skipping[/yellow]")
 
-        _save_manifest(manifest, workspace)
+        manifest.save(workspace)
 
     return manifest
 
@@ -1225,12 +1226,6 @@ def _generate_with_retry(prompt: str, out_path: Path, model: str) -> bool:
                 console.print(f"[red]Image gen error: {exc}[/red]")
                 return False
     return False
-
-
-def _save_manifest(manifest: SceneManifest, workspace: Path) -> None:
-    (workspace / "manifest.json").write_text(
-        manifest.model_dump_json(indent=2), encoding="utf-8"
-    )
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -1332,6 +1327,7 @@ Expected: `ImportError: No module named 'pipeline.video_gen'`
 ```python
 from __future__ import annotations
 import base64
+import os
 from pathlib import Path
 
 import fal_client
@@ -1359,9 +1355,11 @@ def generate_videos(manifest: SceneManifest, workspace: Path) -> SceneManifest:
         console.print(
             f"[bold yellow]Warning: estimated Kling cost ${estimated_cost:.2f} (>{COST_WARN_THRESHOLD}).[/bold yellow]"
         )
-        answer = input("Continue? [y/N] ").strip().lower()
-        if answer != "y":
-            raise SystemExit("Aborted by user.")
+        # FORCE_RUN=1 skips interactive prompt (use in tests / CI)
+        if os.environ.get("FORCE_RUN") != "1":
+            answer = input("Continue? [y/N] ").strip().lower()
+            if answer != "y":
+                raise SystemExit("Aborted by user.")
 
     for scene in manifest.scenes:
         if scene.status != SceneStatus.image_ready:
@@ -1370,8 +1368,8 @@ def generate_videos(manifest: SceneManifest, workspace: Path) -> SceneManifest:
         img_path = images_dir / f"{scene.scene_id}.png"
         clip_path = clips_dir / f"{scene.scene_id}.mp4"
 
-        image_url = _upload_image_to_fal(img_path)
-        success = _generate_with_retry(scene, image_url, clip_path)
+        # C3: upload is inside retry via _generate_with_retry — pass path, not URL
+        success = _generate_with_retry(scene, img_path, clip_path)
 
         if success:
             scene.status = SceneStatus.clip_ready
@@ -1379,14 +1377,16 @@ def generate_videos(manifest: SceneManifest, workspace: Path) -> SceneManifest:
             scene.status = SceneStatus.skipped
             console.print(f"[yellow]Warning: video gen failed for {scene.scene_id}, skipping[/yellow]")
 
-        _save_manifest(manifest, workspace)
+        manifest.save(workspace)
 
     return manifest
 
 
-def _generate_with_retry(scene, image_url: str, clip_path: Path) -> bool:
+def _generate_with_retry(scene, img_path: Path, clip_path: Path) -> bool:
+    # C3: upload is inside the retry loop so upload failures are also retried
     for attempt in range(config.MAX_RETRY + 1):
         try:
+            image_url = _upload_image_to_fal(img_path)
             result = fal_client.subscribe(
                 config.DEFAULT_VIDEO_MODEL,
                 arguments={
@@ -1415,12 +1415,6 @@ def _upload_image_to_fal(img_path: Path) -> str:
     with open(img_path, "rb") as f:
         result = fal_client.upload(f.read(), content_type="image/png")
     return result
-
-
-def _save_manifest(manifest: SceneManifest, workspace: Path) -> None:
-    (workspace / "manifest.json").write_text(
-        manifest.model_dump_json(indent=2), encoding="utf-8"
-    )
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -1481,9 +1475,8 @@ def test_assemble_calls_ffmpeg_and_returns_output_path(tmp_path):
     workspace = tmp_path / "ws"
     output_dir = tmp_path / "output"
     output_dir.mkdir()
+    # _make_ready_manifest already sets status=clip_ready — do NOT downgrade
     manifest = _make_ready_manifest(workspace)
-    # Mark audio_ready too
-    manifest.scenes[0].status = SceneStatus.audio_ready
 
     fake_output = output_dir / "result.mp4"
     fake_output.write_bytes(b"\x00" * 10)
@@ -1503,8 +1496,7 @@ def test_assemble_raises_when_clip_missing(tmp_path):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     manifest = _make_ready_manifest(workspace)
-    manifest.scenes[0].status = SceneStatus.audio_ready
-    # Remove the clip to trigger integrity check
+    # Remove the clip to trigger integrity check (scene is clip_ready but file missing)
     (workspace / "clips" / "S01.mp4").unlink()
 
     with pytest.raises(AssemblyError, match="missing clip"):
@@ -1554,11 +1546,8 @@ class AssemblyError(Exception):
 
 def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path:
     """Merge clips + audio per scene, then concatenate into final MP4."""
-    assemblable = [
-        s for s in manifest.scenes
-        if s.status in (SceneStatus.audio_ready, SceneStatus.clip_ready)
-        and s.status != SceneStatus.skipped
-    ]
+    # Only clip_ready scenes have both a clip AND audio — audio_ready scenes lack clips
+    assemblable = [s for s in manifest.scenes if s.status == SceneStatus.clip_ready]
 
     if not assemblable:
         raise AssemblyError("No assemblable scenes — all scenes were skipped or pending.")
@@ -1613,6 +1602,8 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
 
         scene.status = SceneStatus.assembled
         merged_paths.append(merged_path)
+        # Persist after each scene (C2: assembler must save manifest)
+        manifest.save(workspace)
 
     # Step 3: Concatenate via concat demuxer
     concat_list = tmp_dir / "concat.txt"
@@ -1852,12 +1843,15 @@ def _run_stages(
     else:
         sop = json.loads((workspace / "sop.json").read_text(encoding="utf-8"))
 
+    script: list[dict] | None = None
     if start <= 2 <= end:
         console.rule("[bold]Stage 2: Script Generator[/bold]")
         script = generate_script(sop=sop, duration=args.duration)
 
     if start <= 3 <= end:
         console.rule("[bold]Stage 3: Scene Splitter (+ TTS)[/bold]")
+        if script is None:
+            raise ValueError("Stage 3 requires stage 2. Use --stage 2-3 or run stage 2 first.")
         manifest = split_scenes(
             script=script,
             workspace=workspace,
@@ -1911,7 +1905,9 @@ def _run_tts_stage(manifest: SceneManifest, workspace: Path) -> None:
             voice=manifest.tts_voice or "ko-KR-Wavenet-B",
             output_path=audio_path,
         )
-        scene.status = SceneStatus.audio_ready
+        # Guard: never downgrade clip_ready/assembled — they already have audio
+        if scene.status not in (SceneStatus.clip_ready, SceneStatus.assembled):
+            scene.status = SceneStatus.audio_ready
         (workspace / "manifest.json").write_text(
             manifest.model_dump_json(indent=2), encoding="utf-8"
         )
@@ -1961,7 +1957,7 @@ git commit -m "feat: CLI — argparse, stage range, run-id resume, dry-run, full
 | Spec Requirement | Task |
 |---|---|
 | DOCX/PDF → SOP JSON | Task 5 |
-| Claude API + prompt caching | Task 5, 6 |
+| Gemini API (google-generativeai) | Task 5, 6 |
 | TTS duration-first scene splitting | Task 7 |
 | 8-sec sub-scene split + audio split | Task 7 |
 | FLUX.1-schnell image gen | Task 8 |
