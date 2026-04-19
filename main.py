@@ -1,0 +1,200 @@
+from __future__ import annotations
+import argparse
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from rich.console import Console
+
+import config
+from models.scene_manifest import SceneManifest, SceneStatus
+from pipeline.assembler import assemble, AssemblyError
+from pipeline.image_gen import generate_images
+from pipeline.scene_splitter import split_scenes
+from pipeline.script_gen import generate_script
+from pipeline.sop_parser import parse_sop, ParseError
+from pipeline.tts import synthesize
+from pipeline.video_gen import generate_videos
+
+console = Console()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Safety Training Video Auto-Generation Pipeline"
+    )
+    parser.add_argument("--sop", help="Path to SOP file (.docx or .pdf)")
+    parser.add_argument(
+        "--duration", type=int, default=config.DEFAULT_DURATION,
+        help="Target duration in seconds (30 or 180, default: 180)"
+    )
+    parser.add_argument(
+        "--stage", help="Stage range to run, e.g. '4-5' or '3'"
+    )
+    parser.add_argument(
+        "--run-id", dest="run_id",
+        help="Workspace run_id to resume (required with --stage, auto-detected if omitted)"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show manifest without generating media"
+    )
+    return parser
+
+
+def parse_stage_range(stage_str: str) -> tuple[int, int]:
+    parts = stage_str.split("-")
+    if len(parts) == 1:
+        s = int(parts[0])
+        start = end = s
+    elif len(parts) == 2:
+        start, end = int(parts[0]), int(parts[1])
+    else:
+        raise ValueError(f"Invalid --stage format: {stage_str}")
+    if not (1 <= start <= 7 and 1 <= end <= 7 and start <= end):
+        raise ValueError(f"Invalid --stage range: {stage_str} (valid: 1-7)")
+    return start, end
+
+
+def _resolve_run_id(run_id: str | None) -> str:
+    if run_id:
+        return run_id
+    workspace = config.WORKSPACE_DIR
+    if not workspace.exists():
+        console.print("[red]No workspace found. Provide --run-id or run from Stage 1.[/red]")
+        sys.exit(1)
+    runs = sorted(workspace.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    runs = [r for r in runs if r.is_dir()]
+    if not runs:
+        console.print("[red]No existing workspace run found.[/red]")
+        sys.exit(1)
+    latest = runs[0].name
+    answer = input(f"Use latest run '{latest}'? [y/N] ").strip().lower()
+    if answer != "y":
+        sys.exit("Aborted.")
+    return latest
+
+
+def _load_manifest(workspace: Path) -> SceneManifest:
+    manifest_path = workspace / "manifest.json"
+    if not manifest_path.exists():
+        console.print(f"[red]manifest.json not found in {workspace}[/red]")
+        sys.exit(1)
+    return SceneManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.stage:
+        start, end = parse_stage_range(args.stage)
+        run_id = _resolve_run_id(args.run_id)
+        workspace = config.WORKSPACE_DIR / run_id
+        manifest = _load_manifest(workspace)
+        _run_stages(start, end, manifest=manifest, workspace=workspace, args=args)
+        return
+
+    if not args.sop:
+        parser.error("--sop is required when not using --stage")
+
+    sop_path = Path(args.sop)
+    if not sop_path.exists():
+        console.print(f"[red]SOP file not found: {sop_path}[/red]")
+        sys.exit(1)
+
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    workspace = config.WORKSPACE_DIR / run_id
+    workspace.mkdir(parents=True, exist_ok=True)
+    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    console.print(f"[bold green]Run ID: {run_id}[/bold green]")
+
+    _run_stages(1, 7, sop_path=sop_path, workspace=workspace, args=args)
+
+
+def _run_stages(
+    start: int,
+    end: int,
+    workspace: Path,
+    args: argparse.Namespace,
+    sop_path: Path | None = None,
+    manifest: SceneManifest | None = None,
+) -> None:
+    if start <= 1 <= end:
+        console.rule("[bold]Stage 1: SOP Parser[/bold]")
+        sop = parse_sop(sop_path, run_workspace=workspace)
+    else:
+        sop = json.loads((workspace / "sop.json").read_text(encoding="utf-8"))
+
+    script: list[dict] | None = None
+    if start <= 2 <= end:
+        console.rule("[bold]Stage 2: Script Generator[/bold]")
+        script = generate_script(sop=sop, duration=args.duration)
+
+    if start <= 3 <= end:
+        console.rule("[bold]Stage 3: Scene Splitter (+ TTS)[/bold]")
+        if script is None:
+            raise ValueError("Stage 3 requires stage 2. Use --stage 2-3 or run stage 2 first.")
+        manifest = split_scenes(
+            script=script,
+            workspace=workspace,
+            video_style="shortform" if args.duration <= 30 else "hybrid",
+            sop_title=sop["sop_title"],
+            duration=args.duration,
+        )
+        if args.dry_run:
+            console.print(manifest.model_dump_json(indent=2))
+            return
+
+    if manifest is None:
+        manifest = _load_manifest(workspace)
+
+    if start <= 4 <= end:
+        console.rule("[bold]Stage 4: Image Generator[/bold]")
+        manifest = generate_images(manifest=manifest, workspace=workspace)
+
+    if start <= 5 <= end:
+        console.rule("[bold]Stage 5: Video Generator[/bold]")
+        manifest = generate_videos(manifest=manifest, workspace=workspace)
+
+    if start <= 6 <= end:
+        console.rule("[bold]Stage 6: TTS (fill gaps)[/bold]")
+        _run_tts_stage(manifest, workspace)
+
+    if start <= 7 <= end:
+        console.rule("[bold]Stage 7: Assembler[/bold]")
+        output_path = assemble(
+            manifest=manifest,
+            workspace=workspace,
+            output_dir=config.OUTPUT_DIR,
+        )
+        console.print(f"\n[bold green]Done! Output: {output_path}[/bold green]")
+
+
+def _run_tts_stage(manifest: SceneManifest, workspace: Path) -> None:
+    audio_dir = workspace / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    for scene in manifest.scenes:
+        if scene.status == SceneStatus.skipped:
+            continue
+        audio_path = audio_dir / f"{scene.scene_id}.mp3"
+        if audio_path.exists():
+            console.print(f"[dim]Skip TTS {scene.scene_id} — already exists[/dim]")
+            continue
+        _, dur = synthesize(
+            text=scene.narration_ko,
+            provider=manifest.tts_provider or "google",
+            voice=manifest.tts_voice or "ko-KR-Wavenet-B",
+            output_path=audio_path,
+        )
+        if scene.status not in (SceneStatus.clip_ready, SceneStatus.assembled):
+            scene.status = SceneStatus.audio_ready
+        (workspace / "manifest.json").write_text(
+            manifest.model_dump_json(indent=2), encoding="utf-8"
+        )
+
+
+if __name__ == "__main__":
+    main()

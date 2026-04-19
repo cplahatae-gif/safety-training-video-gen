@@ -1,4 +1,5 @@
 from __future__ import annotations
+import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,13 @@ class AssemblyError(Exception):
 
 
 def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path:
+    if not shutil.which("ffmpeg"):
+        raise SystemExit(
+            "FFmpeg not found. Install it:\n"
+            "  Windows: winget install Gyan.FFmpeg\n"
+            "  Mac:     brew install ffmpeg\n"
+            "  Linux:   sudo apt install ffmpeg"
+        )
     assemblable = [
         s for s in manifest.scenes
         if s.status in (SceneStatus.clip_ready, SceneStatus.merged_ready)
