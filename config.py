@@ -2,7 +2,9 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Secrets live outside Drive to avoid leaking API keys via Drive sync.
+_SECRETS_ENV = Path.home() / ".secrets" / "safety-video-gen" / ".env"
+load_dotenv(_SECRETS_ENV if _SECRETS_ENV.exists() else None)
 
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 REPLICATE_API_TOKEN: str = os.getenv("REPLICATE_API_TOKEN", "")
