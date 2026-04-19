@@ -1,5 +1,7 @@
 from __future__ import annotations
 import os
+import re
+import time
 from pathlib import Path
 
 import replicate
@@ -12,6 +14,16 @@ console = Console()
 
 COST_PER_SEC = 0.05
 COST_WARN_THRESHOLD = 15.0
+THROTTLE_MAX_RETRIES = 5
+_RESET_RE = re.compile(r"resets in\s*~?(\d+)s")
+
+
+def _throttle_sleep_seconds(exc: Exception) -> int | None:
+    msg = str(exc)
+    if "429" not in msg and "throttled" not in msg.lower():
+        return None
+    match = _RESET_RE.search(msg)
+    return (int(match.group(1)) + 1) if match else 10
 
 
 def generate_videos(manifest: SceneManifest, workspace: Path) -> SceneManifest:
@@ -53,6 +65,7 @@ def generate_videos(manifest: SceneManifest, workspace: Path) -> SceneManifest:
 
 def _generate_with_retry(scene, img_path: Path, clip_path: Path) -> bool:
     duration = 10 if scene.duration_sec > 5 else 5
+    throttle_retries = 0
     for attempt in range(config.MAX_RETRY + 1):
         try:
             with open(img_path, "rb") as img_file:
@@ -72,6 +85,12 @@ def _generate_with_retry(scene, img_path: Path, clip_path: Path) -> bool:
             clip_path.write_bytes(data)
             return True
         except Exception as exc:
+            sleep_s = _throttle_sleep_seconds(exc)
+            if sleep_s is not None and throttle_retries < THROTTLE_MAX_RETRIES:
+                throttle_retries += 1
+                console.print(f"[dim]429 throttled - sleeping {sleep_s}s (retry {throttle_retries}/{THROTTLE_MAX_RETRIES})[/dim]")
+                time.sleep(sleep_s)
+                continue
             if attempt == config.MAX_RETRY:
                 console.print(f"[red]Video gen error: {exc}[/red]")
                 return False

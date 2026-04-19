@@ -1,4 +1,6 @@
 from __future__ import annotations
+import re
+import time
 from pathlib import Path
 
 import replicate
@@ -8,6 +10,17 @@ import config
 from models.scene_manifest import SceneManifest, SceneStatus
 
 console = Console()
+
+THROTTLE_MAX_RETRIES = 5
+_RESET_RE = re.compile(r"resets in\s*~?(\d+)s")
+
+
+def _throttle_sleep_seconds(exc: Exception) -> int | None:
+    msg = str(exc)
+    if "429" not in msg and "throttled" not in msg.lower():
+        return None
+    match = _RESET_RE.search(msg)
+    return (int(match.group(1)) + 1) if match else 10
 
 
 def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
@@ -25,7 +38,7 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
             continue
         if scene.status in (SceneStatus.image_ready, SceneStatus.clip_ready,
                              SceneStatus.merged_ready, SceneStatus.assembled):
-            console.print(f"[dim]Skip {scene.scene_id} — already at {scene.status}[/dim]")
+            console.print(f"[dim]Skip {scene.scene_id} - already at {scene.status}[/dim]")
             continue
 
         out_path = images_dir / f"{scene.scene_id}.png"
@@ -42,6 +55,7 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
 
 
 def _generate_with_retry(prompt: str, out_path: Path, model: str) -> bool:
+    throttle_retries = 0
     for attempt in range(config.MAX_RETRY + 1):
         try:
             output = replicate.run(
@@ -60,6 +74,12 @@ def _generate_with_retry(prompt: str, out_path: Path, model: str) -> bool:
             out_path.write_bytes(data)
             return True
         except Exception as exc:
+            sleep_s = _throttle_sleep_seconds(exc)
+            if sleep_s is not None and throttle_retries < THROTTLE_MAX_RETRIES:
+                throttle_retries += 1
+                console.print(f"[dim]429 throttled - sleeping {sleep_s}s (retry {throttle_retries}/{THROTTLE_MAX_RETRIES})[/dim]")
+                time.sleep(sleep_s)
+                continue
             if attempt == config.MAX_RETRY:
                 console.print(f"[red]Image gen error: {exc}[/red]")
                 return False

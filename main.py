@@ -192,14 +192,14 @@ def _run_tts_stage(manifest: SceneManifest, workspace: Path) -> None:
             continue
         audio_path = audio_dir / f"{scene.scene_id}.mp3"
         if audio_path.exists():
-            console.print(f"[dim]Skip TTS {scene.scene_id} — already exists[/dim]")
+            console.print(f"[dim]Skip TTS {scene.scene_id} - already exists[/dim]")
             continue
         if _SUB_SCENE_RE.match(scene.scene_id):
             # Sub-scene audio is a slice of the parent's audio. Re-synthesizing
             # scene.narration_ko would produce the full parent narration and
             # break sub-scene timing. Rebuild requires re-running Stage 3.
             console.print(
-                f"[yellow]Skip TTS {scene.scene_id} — sub-scene audio missing; "
+                f"[yellow]Skip TTS {scene.scene_id} - sub-scene audio missing; "
                 f"re-run stage 3 to regenerate from parent.[/yellow]"
             )
             continue
