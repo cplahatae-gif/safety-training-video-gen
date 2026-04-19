@@ -6,7 +6,7 @@
 
 **Architecture:** Each stage is an independent Python module in `pipeline/`. Stages communicate via `workspace/<run_id>/` directory (manifest.json as shared state, images/, clips/, audio/ for artifacts). `manifest.json` carries a `status` field per scene so partial reruns and partial failures are handled gracefully. TTS is synthesized in Stage 3; Stage 6 fills gaps for any scenes missing audio (e.g., sub-scene splits or partial re-runs).
 
-**Tech Stack:** Python 3.12, uv, google-generativeai>=0.8.0, fal-client, google-cloud-texttospeech, python-docx, pdfplumber, pydantic>=2.0, python-ffmpeg, python-dotenv, rich, pytest
+**Tech Stack:** Python 3.12, uv, google-generativeai>=0.8.0, replicate>=1.0, google-cloud-texttospeech, python-docx, pdfplumber, pydantic>=2.0, python-ffmpeg, python-dotenv, rich, pytest
 
 ---
 
@@ -36,8 +36,8 @@
 | `tests/test_sop_parser.py` | DOCX/PDF parse + Gemini structuring |
 | `tests/test_script_gen.py` | Script generation via Gemini |
 | `tests/test_scene_splitter.py` | Scene splitting, TTS call, sub-scene logic |
-| `tests/test_image_gen.py` | Image generation with fal mocking |
-| `tests/test_video_gen.py` | Video generation with fal mocking |
+| `tests/test_image_gen.py` | Image generation with Replicate mocking |
+| `tests/test_video_gen.py` | Video generation with Replicate mocking |
 | `tests/test_assembler.py` | FFmpeg assembly with subprocess mocking |
 | `tests/test_cli.py` | CLI argument parsing |
 | `tests/fixtures/sample_sop.json` | Fixture SOP JSON |
@@ -71,7 +71,7 @@ Expected: `pyproject.toml` and `.python-version` created.
 ```bash
 uv add google-generativeai pydantic python-dotenv rich
 uv add python-docx pdfplumber
-uv add fal-client
+uv add replicate
 uv add google-cloud-texttospeech
 uv add python-ffmpeg
 uv add httpx
@@ -90,12 +90,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-FAL_KEY: str = os.getenv("FAL_KEY", "")
+REPLICATE_API_TOKEN: str = os.getenv("REPLICATE_API_TOKEN", "")
 GOOGLE_APPLICATION_CREDENTIALS: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY", "")
 
-DEFAULT_IMAGE_MODEL: str = os.getenv("DEFAULT_IMAGE_MODEL", "fal-ai/flux/schnell")
-DEFAULT_VIDEO_MODEL: str = os.getenv("DEFAULT_VIDEO_MODEL", "fal-ai/kling-video/v3/pro/image-to-video")
+DEFAULT_IMAGE_MODEL: str = os.getenv("DEFAULT_IMAGE_MODEL", "black-forest-labs/flux-schnell")
+DEFAULT_VIDEO_MODEL: str = os.getenv("DEFAULT_VIDEO_MODEL", "kwaivgi/kling-v2.5-turbo-pro")
 USE_FLUX_DEV: bool = os.getenv("USE_FLUX_DEV", "false").lower() == "true"
 DEFAULT_DURATION: int = int(os.getenv("DEFAULT_DURATION", "180"))
 MAX_RETRY: int = int(os.getenv("MAX_RETRY", "1"))
@@ -108,12 +108,12 @@ GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 ```
 GEMINI_API_KEY=
-FAL_KEY=
+REPLICATE_API_TOKEN=
 GOOGLE_APPLICATION_CREDENTIALS=path/to/service-account.json
 ELEVENLABS_API_KEY=
 
-DEFAULT_IMAGE_MODEL=fal-ai/flux/schnell
-DEFAULT_VIDEO_MODEL=fal-ai/kling-video/v3/pro/image-to-video
+DEFAULT_IMAGE_MODEL=black-forest-labs/flux-schnell
+DEFAULT_VIDEO_MODEL=kwaivgi/kling-v2.5-turbo-pro
 USE_FLUX_DEV=false
 DEFAULT_DURATION=180
 MAX_RETRY=1
@@ -1139,12 +1139,11 @@ def test_generate_images_saves_png_and_updates_status(tmp_path):
 
     fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
 
-    with patch("pipeline.image_gen.fal_client.subscribe") as mock_sub, \
-         patch("pipeline.image_gen.httpx.get") as mock_get:
-        mock_sub.return_value = {"images": [{"url": "https://fal.ai/fake.png"}]}
-        mock_resp = MagicMock()
-        mock_resp.content = fake_png
-        mock_get.return_value = mock_resp
+    fake_file = MagicMock()
+    fake_file.read.return_value = fake_png
+
+    with patch("pipeline.image_gen.replicate.run") as mock_run:
+        mock_run.return_value = [fake_file]
 
         updated = generate_images(manifest=manifest, workspace=workspace)
 
@@ -1159,7 +1158,7 @@ def test_generate_images_skips_scene_after_two_failures(tmp_path):
     workspace = tmp_path / "ws"
     (workspace / "images").mkdir(parents=True)
 
-    with patch("pipeline.image_gen.fal_client.subscribe", side_effect=RuntimeError("API error")):
+    with patch("pipeline.image_gen.replicate.run", side_effect=RuntimeError("API error")):
         updated = generate_images(manifest=manifest, workspace=workspace)
 
     assert updated.scenes[0].status == SceneStatus.skipped
@@ -1177,11 +1176,9 @@ Expected: `ImportError: No module named 'pipeline.image_gen'`
 
 ```python
 from __future__ import annotations
-import json
 from pathlib import Path
 
-import fal_client
-import httpx
+import replicate
 from rich.console import Console
 
 import config
@@ -1195,7 +1192,7 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
     images_dir.mkdir(parents=True, exist_ok=True)
 
     model = (
-        "fal-ai/flux/dev/image-to-image"
+        "black-forest-labs/flux-dev"
         if config.USE_FLUX_DEV
         else config.DEFAULT_IMAGE_MODEL
     )
@@ -1223,23 +1220,22 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
 
 
 def _generate_with_retry(prompt: str, out_path: Path, model: str) -> bool:
+    # replicate.run returns a list of FileOutput objects for FLUX models.
+    # Each FileOutput supports .read() → bytes. No separate URL download needed.
     for attempt in range(config.MAX_RETRY + 1):
         try:
-            result = fal_client.subscribe(
+            output = replicate.run(
                 model,
-                arguments={
+                input={
                     "prompt": prompt,
-                    "image_size": "landscape_16_9",
+                    "aspect_ratio": "16:9",
                     "num_inference_steps": 4,
-                    "num_images": 1,
-                    "enable_safety_checker": False,
+                    "num_outputs": 1,
+                    "output_format": "png",
+                    "disable_safety_checker": True,
                 },
-                with_logs=False,
             )
-            image_url = result["images"][0]["url"]
-            response = httpx.get(image_url, timeout=30)
-            response.raise_for_status()
-            out_path.write_bytes(response.content)
+            out_path.write_bytes(output[0].read())
             return True
         except Exception as exc:
             if attempt == config.MAX_RETRY:
@@ -1260,7 +1256,7 @@ Expected: 2 tests PASSED.
 
 ```bash
 git add pipeline/image_gen.py tests/test_image_gen.py
-git commit -m "feat: image generator — FLUX.1-schnell via fal-client, retry + skip on failure"
+git commit -m "feat: image generator — FLUX.1-schnell via replicate, retry + skip on failure"
 ```
 
 ---
@@ -1304,17 +1300,16 @@ def _make_manifest_with_image(tmp_path: Path) -> tuple[SceneManifest, Path]:
     return manifest, workspace
 
 
-def test_generate_videos_downloads_and_updates_status(tmp_path):
+def test_generate_videos_downloads_and_updates_status(tmp_path, monkeypatch):
     manifest, workspace = _make_manifest_with_image(tmp_path)
+    monkeypatch.setenv("FORCE_RUN", "1")
     fake_mp4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 100
 
-    with patch("pipeline.video_gen.fal_client.subscribe") as mock_sub, \
-         patch("pipeline.video_gen.httpx.get") as mock_get, \
-         patch("pipeline.video_gen._upload_image_to_fal", return_value="https://fal.ai/img.png"):
-        mock_sub.return_value = {"video": {"url": "https://fal.ai/fake.mp4"}}
-        mock_resp = MagicMock()
-        mock_resp.content = fake_mp4
-        mock_get.return_value = mock_resp
+    fake_file = MagicMock()
+    fake_file.read.return_value = fake_mp4
+
+    with patch("pipeline.video_gen.replicate.run") as mock_run:
+        mock_run.return_value = fake_file
 
         updated = generate_videos(manifest=manifest, workspace=workspace)
 
@@ -1324,11 +1319,11 @@ def test_generate_videos_downloads_and_updates_status(tmp_path):
     assert updated.scenes[0].status == SceneStatus.clip_ready
 
 
-def test_generate_videos_skips_scene_after_two_failures(tmp_path):
+def test_generate_videos_skips_scene_after_two_failures(tmp_path, monkeypatch):
     manifest, workspace = _make_manifest_with_image(tmp_path)
+    monkeypatch.setenv("FORCE_RUN", "1")
 
-    with patch("pipeline.video_gen.fal_client.subscribe", side_effect=RuntimeError("Kling error")), \
-         patch("pipeline.video_gen._upload_image_to_fal", return_value="https://fal.ai/img.png"):
+    with patch("pipeline.video_gen.replicate.run", side_effect=RuntimeError("Kling error")):
         updated = generate_videos(manifest=manifest, workspace=workspace)
 
     assert updated.scenes[0].status == SceneStatus.skipped
@@ -1346,12 +1341,10 @@ Expected: `ImportError: No module named 'pipeline.video_gen'`
 
 ```python
 from __future__ import annotations
-import base64
 import os
 from pathlib import Path
 
-import fal_client
-import httpx
+import replicate
 from rich.console import Console
 
 import config
@@ -1359,8 +1352,9 @@ from models.scene_manifest import SceneManifest, SceneStatus
 
 console = Console()
 
-COST_PER_SEC = 0.112
-COST_WARN_THRESHOLD = 30.0
+# Kling v2.5 Turbo Pro on Replicate: ~$0.05/sec (3min clip ≈ $9).
+COST_PER_SEC = 0.05
+COST_WARN_THRESHOLD = 15.0
 
 
 def generate_videos(manifest: SceneManifest, workspace: Path) -> SceneManifest:
@@ -1388,7 +1382,6 @@ def generate_videos(manifest: SceneManifest, workspace: Path) -> SceneManifest:
         img_path = images_dir / f"{scene.scene_id}.png"
         clip_path = clips_dir / f"{scene.scene_id}.mp4"
 
-        # C3: upload is inside retry via _generate_with_retry — pass path, not URL
         success = _generate_with_retry(scene, img_path, clip_path)
 
         if success:
@@ -1403,38 +1396,30 @@ def generate_videos(manifest: SceneManifest, workspace: Path) -> SceneManifest:
 
 
 def _generate_with_retry(scene, img_path: Path, clip_path: Path) -> bool:
-    # C3: upload is inside the retry loop so upload failures are also retried
+    # replicate.run accepts a file handle directly for image inputs — no upload step.
+    # Returns a single FileOutput for Kling. .read() → bytes.
+    # Kling v2.5 Turbo Pro supports duration 5 or 10 seconds.
+    duration = 10 if scene.duration_sec > 5 else 5
     for attempt in range(config.MAX_RETRY + 1):
         try:
-            image_url = _upload_image_to_fal(img_path)
-            result = fal_client.subscribe(
-                config.DEFAULT_VIDEO_MODEL,
-                arguments={
-                    "prompt": scene.motion_prompt,
-                    "image_url": image_url,
-                    "duration": str(min(scene.duration_sec, 8)),
-                    "aspect_ratio": "16:9",
-                    "negative_prompt": "blur, distort, low quality, watermark",
-                },
-                with_logs=False,
-            )
-            video_url = result["video"]["url"]
-            response = httpx.get(video_url, timeout=120)
-            response.raise_for_status()
-            clip_path.write_bytes(response.content)
+            with open(img_path, "rb") as img_file:
+                output = replicate.run(
+                    config.DEFAULT_VIDEO_MODEL,
+                    input={
+                        "prompt": scene.motion_prompt,
+                        "start_image": img_file,
+                        "duration": duration,
+                        "aspect_ratio": "16:9",
+                        "negative_prompt": "blur, distort, low quality, watermark",
+                    },
+                )
+            clip_path.write_bytes(output.read())
             return True
         except Exception as exc:
             if attempt == config.MAX_RETRY:
                 console.print(f"[red]Video gen error: {exc}[/red]")
                 return False
     return False
-
-
-def _upload_image_to_fal(img_path: Path) -> str:
-    """Upload local image to fal storage, return public URL."""
-    with open(img_path, "rb") as f:
-        result = fal_client.upload(f.read(), content_type="image/png")
-    return result
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -1449,7 +1434,7 @@ Expected: 2 tests PASSED.
 
 ```bash
 git add pipeline/video_gen.py tests/test_video_gen.py
-git commit -m "feat: video generator — Kling 3.0 via fal-client, $30 cost gate, retry+skip"
+git commit -m "feat: video generator — Kling 2.5 Turbo Pro via replicate, $15 cost gate, retry+skip"
 ```
 
 ---

@@ -1,8 +1,12 @@
 .env
 *.json
 !docs/**/*.json
+!tests/fixtures/*.json
 workspace/
 output/
 __pycache__/
 *.pyc
 .venv/
+.claude/
+desktop.ini
+keys/
