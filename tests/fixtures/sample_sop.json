@@ -1,0 +1,10 @@
+{
+  "sop_title": "고소작업차 운용 표준 안전작업지침",
+  "legal_basis": ["산업안전보건기준에 관한 규칙 제186조"],
+  "hazards": [{"id": "H1", "name": "추락", "severity": "사망"}],
+  "procedure_steps": [
+    {"step": 1, "action": "작업 전 점검", "key_rules": ["아웃리거 완전 전개"]}
+  ],
+  "target_audience": "중장비 운전자",
+  "common_violations": ["안전대 미착용"]
+}

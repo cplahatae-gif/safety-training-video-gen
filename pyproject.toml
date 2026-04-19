@@ -1,0 +1,24 @@
+[project]
+name = "safety-training-video-gen"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-cloud-texttospeech>=2.36.0",
+    "google-generativeai>=0.8.6",
+    "httpx>=0.28.1",
+    "pdfplumber>=0.11.9",
+    "pydantic>=2.13.2",
+    "python-docx>=1.2.0",
+    "python-dotenv>=1.2.2",
+    "python-ffmpeg>=2.0.12",
+    "replicate>=1.0.7",
+    "rich>=15.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-mock>=3.15.1",
+]
