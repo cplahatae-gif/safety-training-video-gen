@@ -58,26 +58,36 @@ def _elevenlabs_tts(text: str, voice_id: str) -> bytes:
     api_key = os.getenv("ELEVENLABS_API_KEY", "")
     if not api_key:
         raise TtsError("ELEVENLABS_API_KEY not set")
-    response = httpx.post(
-        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-        headers={"xi-api-key": api_key, "Content-Type": "application/json"},
-        json={"text": text, "model_id": "eleven_multilingual_v2"},
-        timeout=30,
-    )
-    response.raise_for_status()
+    try:
+        response = httpx.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+            json={"text": text, "model_id": "eleven_multilingual_v2"},
+            timeout=30,
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise TtsError(f"ElevenLabs returned {e.response.status_code}: {e.response.text[:200]}") from e
+    except httpx.RequestError as e:
+        raise TtsError(f"ElevenLabs network error: {e}") from e
     return response.content
 
 
 def _audio_duration(audio_path: Path) -> float:
-    result = subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(audio_path),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(audio_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError as e:
+        raise TtsError("ffprobe not found on PATH — install ffmpeg (winget install ffmpeg)") from e
+    except subprocess.CalledProcessError as e:
+        raise TtsError(f"ffprobe failed on {audio_path}: {e.stderr.strip()}") from e
     return float(result.stdout.strip())
