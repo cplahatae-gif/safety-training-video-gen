@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -123,10 +124,17 @@ def _run_stages(
     manifest: SceneManifest | None = None,
 ) -> None:
     if start <= 1 <= end:
+        if sop_path is None:
+            console.print("[red]--sop is required when stage range includes 1[/red]")
+            sys.exit(1)
         console.rule("[bold]Stage 1: SOP Parser[/bold]")
         sop = parse_sop(sop_path, run_workspace=workspace)
     else:
-        sop = json.loads((workspace / "sop.json").read_text(encoding="utf-8"))
+        sop_json_path = workspace / "sop.json"
+        if not sop_json_path.exists():
+            console.print(f"[red]sop.json not found in {workspace}. Run stage 1 first or provide --sop.[/red]")
+            sys.exit(1)
+        sop = json.loads(sop_json_path.read_text(encoding="utf-8"))
 
     script: list[dict] | None = None
     if start <= 2 <= end:
@@ -173,6 +181,9 @@ def _run_stages(
         console.print(f"\n[bold green]Done! Output: {output_path}[/bold green]")
 
 
+_SUB_SCENE_RE = re.compile(r"^S\d+[a-z]$")
+
+
 def _run_tts_stage(manifest: SceneManifest, workspace: Path) -> None:
     audio_dir = workspace / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -183,7 +194,16 @@ def _run_tts_stage(manifest: SceneManifest, workspace: Path) -> None:
         if audio_path.exists():
             console.print(f"[dim]Skip TTS {scene.scene_id} — already exists[/dim]")
             continue
-        _, dur = synthesize(
+        if _SUB_SCENE_RE.match(scene.scene_id):
+            # Sub-scene audio is a slice of the parent's audio. Re-synthesizing
+            # scene.narration_ko would produce the full parent narration and
+            # break sub-scene timing. Rebuild requires re-running Stage 3.
+            console.print(
+                f"[yellow]Skip TTS {scene.scene_id} — sub-scene audio missing; "
+                f"re-run stage 3 to regenerate from parent.[/yellow]"
+            )
+            continue
+        synthesize(
             text=scene.narration_ko,
             provider=manifest.tts_provider or "google",
             voice=manifest.tts_voice or "ko-KR-Wavenet-B",

@@ -1,5 +1,6 @@
 import json
 import pytest
+from pydantic import ValidationError
 from models.scene_manifest import Scene, SceneManifest, SceneStatus, SopJson
 
 def test_scene_status_lifecycle():
@@ -59,3 +60,50 @@ def test_sop_json_validates():
         target_audience="작업자", common_violations=[]
     )
     assert sop.sop_title == "테스트"
+
+
+def _valid_scene_kwargs(**overrides):
+    base = dict(
+        scene_id="S01", act="hook", duration_sec=8,
+        narration_ko="n", image_prompt="p",
+        motion_prompt="m", camera="wide", mood="tense",
+    )
+    base.update(overrides)
+    return base
+
+
+@pytest.mark.parametrize("bad_id", [
+    "S01'\nfile '/etc/passwd",  # concat.txt single-quote injection
+    "../evil",                   # path traversal
+    "S01/sub",                   # path separator
+    "S01\\sub",                  # windows separator
+    "",                          # empty
+    "S" * 33,                    # too long
+    "S01 a",                     # space
+])
+def test_scene_id_rejects_dangerous_values(bad_id):
+    with pytest.raises(ValidationError):
+        Scene(**_valid_scene_kwargs(scene_id=bad_id))
+
+
+@pytest.mark.parametrize("good_id", ["S01", "S01a", "scene_1", "S-01", "A1B2"])
+def test_scene_id_accepts_safe_values(good_id):
+    assert Scene(**_valid_scene_kwargs(scene_id=good_id)).scene_id == good_id
+
+
+@pytest.mark.parametrize("bad_title", [
+    "../../Users/Public/pwn",        # path traversal
+    "test\x00null",                  # NUL byte
+    "line1\nline2",                  # newline
+    "bad/slash",
+    "bad\\slash",
+    "",
+    "x" * 101,                        # too long
+])
+def test_sop_title_rejects_dangerous_values(bad_title):
+    with pytest.raises(ValidationError):
+        SceneManifest(
+            sop_title=bad_title, total_duration_sec=8,
+            video_style="hybrid",
+            scenes=[Scene(**_valid_scene_kwargs())],
+        )

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 import shutil
 import subprocess
 from datetime import datetime
@@ -10,6 +11,12 @@ from models.scene_manifest import SceneManifest, SceneStatus
 from pipeline.tts import _audio_duration
 
 console = Console()
+
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 class AssemblyError(Exception):
@@ -87,7 +94,7 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
     ]
     concat_list = tmp_dir / "concat.txt"
     concat_list.write_text(
-        "\n".join(f"file '{p.resolve()}'" for p in merged_paths),
+        "\n".join(f"file '{p.resolve().as_posix()}'" for p in merged_paths),
         encoding="utf-8",
     )
 
@@ -113,6 +120,13 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
 
 def _final_output_path(sop_title: str, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    safe_title = sop_title.replace(" ", "_").replace("/", "-")[:40]
+    # Whitelist: alphanumerics, underscore, hyphen, Korean syllables.
+    safe_title = re.sub(r"[^A-Za-z0-9_\-\uAC00-\uD7A3]", "_", sop_title)[:40].strip("._-") or "untitled"
+    if safe_title.upper() in _WINDOWS_RESERVED:
+        safe_title = f"_{safe_title}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return output_dir / f"{safe_title}_{timestamp}.mp4"
+    candidate = (output_dir / f"{safe_title}_{timestamp}.mp4").resolve()
+    output_root = output_dir.resolve()
+    if output_root not in candidate.parents:
+        raise AssemblyError(f"output path escapes output_dir: {candidate}")
+    return candidate

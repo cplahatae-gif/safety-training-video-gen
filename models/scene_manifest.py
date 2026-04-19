@@ -2,7 +2,7 @@ from __future__ import annotations
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Literal
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SceneStatus(str, Enum):
@@ -10,14 +10,25 @@ class SceneStatus(str, Enum):
     audio_ready = "audio_ready"
     image_ready = "image_ready"
     clip_ready = "clip_ready"
-    merged_ready = "merged_ready"   # per-scene merge done; final concat pending
+    merged_ready = "merged_ready"
     assembled = "assembled"
     skipped = "skipped"
 
 
+# scene_id is used as a filename segment across the pipeline (audio, images,
+# clips, merged, concat.txt). Restricting to alphanumerics + underscore/hyphen
+# blocks path traversal, ffmpeg concat-list injection (single quotes, newlines),
+# and Windows reserved characters.
+_SCENE_ID_PATTERN = r"^[A-Za-z0-9_-]{1,32}$"
+_ACT_PATTERN = r"^[a-z_]{1,20}$"
+# sop_title flows into output filenames; block control chars, path separators,
+# and outright empty strings. Korean syllables (U+AC00..U+D7A3) allowed.
+_SOP_TITLE_PATTERN = r"^[^\x00-\x1f/\\]{1,100}$"
+
+
 class Scene(BaseModel):
-    scene_id: str
-    act: str
+    scene_id: str = Field(pattern=_SCENE_ID_PATTERN)
+    act: str = Field(pattern=_ACT_PATTERN)
     duration_sec: int
     status: SceneStatus = SceneStatus.pending
     narration_ko: str
@@ -29,7 +40,7 @@ class Scene(BaseModel):
 
 
 class SceneManifest(BaseModel):
-    sop_title: str
+    sop_title: str = Field(pattern=_SOP_TITLE_PATTERN)
     total_duration_sec: int
     video_style: Literal["hybrid", "shortform"]
     tts_provider: Optional[str] = None
@@ -56,7 +67,7 @@ class ProcedureStep(BaseModel):
 
 
 class SopJson(BaseModel):
-    sop_title: str
+    sop_title: str = Field(pattern=_SOP_TITLE_PATTERN)
     legal_basis: list[str]
     hazards: list[Hazard]
     procedure_steps: list[ProcedureStep]

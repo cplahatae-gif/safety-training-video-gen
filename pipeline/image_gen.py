@@ -52,7 +52,6 @@ def _generate_with_retry(prompt: str, out_path: Path, model: str) -> bool:
                     "num_inference_steps": 4,
                     "num_outputs": 1,
                     "output_format": "png",
-                    "disable_safety_checker": True,
                 },
             )
             out_path.write_bytes(output[0].read())
