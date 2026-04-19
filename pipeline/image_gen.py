@@ -54,7 +54,10 @@ def _generate_with_retry(prompt: str, out_path: Path, model: str) -> bool:
                     "output_format": "png",
                 },
             )
-            out_path.write_bytes(output[0].read())
+            data = output[0].read()
+            if not data:
+                raise ValueError(f"empty image response from {model}")
+            out_path.write_bytes(data)
             return True
         except Exception as exc:
             if attempt == config.MAX_RETRY:

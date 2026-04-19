@@ -1,7 +1,6 @@
 import json
 from unittest.mock import MagicMock, patch
 import pytest
-import google.generativeai as genai
 from pipeline.script_gen import generate_script
 
 FAKE_SCENES = [
@@ -15,14 +14,17 @@ FAKE_SCENES = [
 ]
 
 
-def test_generate_script_3min_returns_scene_list(sample_sop):
+def _mock_client():
     mock_response = MagicMock()
     mock_response.text = json.dumps(FAKE_SCENES)
-    with patch("pipeline.script_gen.genai.GenerativeModel") as mock_model_cls:
-        mock_model = MagicMock()
-        mock_model.generate_content.return_value = mock_response
-        mock_model_cls.return_value = mock_model
+    mock_client = MagicMock()
+    mock_client.models.generate_content.return_value = mock_response
+    return mock_client
 
+
+def test_generate_script_3min_returns_scene_list(sample_sop):
+    mock_client = _mock_client()
+    with patch("pipeline.script_gen.genai.Client", return_value=mock_client):
         scenes = generate_script(sop=sample_sop, duration=180)
 
     assert isinstance(scenes, list)
@@ -33,15 +35,10 @@ def test_generate_script_3min_returns_scene_list(sample_sop):
 
 
 def test_generate_script_30sec_uses_shortform_template(sample_sop):
-    mock_response = MagicMock()
-    mock_response.text = json.dumps(FAKE_SCENES)
-    with patch("pipeline.script_gen.genai.GenerativeModel") as mock_model_cls:
-        mock_model = MagicMock()
-        mock_model.generate_content.return_value = mock_response
-        mock_model_cls.return_value = mock_model
+    mock_client = _mock_client()
+    with patch("pipeline.script_gen.genai.Client", return_value=mock_client):
+        generate_script(sop=sample_sop, duration=30)
+        call_kwargs = mock_client.models.generate_content.call_args.kwargs
 
-        scenes = generate_script(sop=sample_sop, duration=30)
-        call_args = mock_model.generate_content.call_args
-
-    user_content = call_args[0][0]
+    user_content = call_kwargs["contents"]
     assert "30초" in user_content or "shortform" in user_content.lower()

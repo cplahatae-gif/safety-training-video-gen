@@ -66,7 +66,10 @@ def _generate_with_retry(scene, img_path: Path, clip_path: Path) -> bool:
                         "negative_prompt": "blur, distort, low quality, watermark",
                     },
                 )
-            clip_path.write_bytes(output.read())
+            data = output.read()
+            if not data:
+                raise ValueError(f"empty video response from {config.DEFAULT_VIDEO_MODEL}")
+            clip_path.write_bytes(data)
             return True
         except Exception as exc:
             if attempt == config.MAX_RETRY:

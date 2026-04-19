@@ -57,12 +57,10 @@ def _extract_text_pdf(path: Path) -> str:
 
 
 def _gemini_structure(raw_text: str) -> dict:
-    import google.generativeai as genai
-    genai.configure(api_key=config.GEMINI_API_KEY)
-    model = genai.GenerativeModel(
-        model_name=config.GEMINI_MODEL,
-        system_instruction=SYSTEM_PROMPT,
-    )
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=config.GEMINI_API_KEY)
+    gen_config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
     prompt = f"""다음 SOP 원문을 분석하여 JSON으로 구조화하세요.
 
 원문:
@@ -80,11 +78,15 @@ def _gemini_structure(raw_text: str) -> dict:
 
     for attempt in range(config.MAX_RETRY + 1):
         try:
-            response = model.generate_content(prompt)
-            if not response.candidates or not response.candidates[0].content.parts:
+            response = client.models.generate_content(
+                model=config.GEMINI_MODEL,
+                contents=prompt,
+                config=gen_config,
+            )
+            text = (response.text or "").strip()
+            if not text:
                 finish = getattr(response.candidates[0], "finish_reason", "unknown") if response.candidates else "no_candidates"
                 raise ParseError(f"Gemini returned no content (finish_reason={finish})")
-            text = response.text.strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
                 if text.startswith("json"):

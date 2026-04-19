@@ -23,6 +23,15 @@ class AssemblyError(Exception):
     pass
 
 
+def _run_ffmpeg(cmd: list[str], stage: str) -> None:
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
+        console.print(f"[red]ffmpeg {stage} failed (exit {exc.returncode}):[/red]\n{stderr}")
+        raise AssemblyError(f"ffmpeg {stage} failed: {stderr.strip().splitlines()[-1] if stderr else 'no stderr'}") from exc
+
+
 def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path:
     if not shutil.which("ffmpeg"):
         raise SystemExit(
@@ -56,14 +65,19 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
 
     for scene in assemblable:
         merged_path = tmp_dir / f"{scene.scene_id}_merged.mp4"
-        if merged_path.exists():
+        # Truncated/zero-byte files from a prior crashed run would silently
+        # propagate into concat and produce a broken output. Treat them as
+        # missing so the merge step re-runs.
+        if merged_path.exists() and merged_path.stat().st_size >= 1024:
             continue
+        if merged_path.exists():
+            merged_path.unlink()
 
         clip_path = clips_dir / f"{scene.scene_id}.mp4"
         audio_path = audio_dir / f"{scene.scene_id}.mp3"
         norm_path = tmp_dir / f"{scene.scene_id}_norm.mp4"
 
-        subprocess.run(
+        _run_ffmpeg(
             [
                 "ffmpeg", "-y", "-i", str(clip_path),
                 "-vf", "scale=1920:1080",
@@ -71,10 +85,10 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
                 "-c:v", "libx264", "-preset", "fast",
                 str(norm_path),
             ],
-            check=True, capture_output=True,
+            stage=f"normalize {scene.scene_id}",
         )
         audio_dur = _audio_duration(audio_path)
-        subprocess.run(
+        _run_ffmpeg(
             [
                 "ffmpeg", "-y",
                 "-i", str(norm_path),
@@ -83,7 +97,7 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
                 "-c:v", "copy", "-c:a", "aac",
                 str(merged_path),
             ],
-            check=True, capture_output=True,
+            stage=f"merge {scene.scene_id}",
         )
         scene.status = SceneStatus.merged_ready
         manifest.save(workspace)
@@ -99,7 +113,7 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
     )
 
     output_path = _final_output_path(manifest.sop_title, output_dir)
-    subprocess.run(
+    _run_ffmpeg(
         [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0",
@@ -107,7 +121,7 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
             "-c", "copy",
             str(output_path),
         ],
-        check=True, capture_output=True,
+        stage="concat",
     )
 
     for scene in assemblable:
