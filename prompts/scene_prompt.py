@@ -5,6 +5,6 @@ CHARACTER_PREFIX = (
 )
 
 
-def build_image_prompt(scene_image_prompt: str) -> str:
-    """Prepend character consistency prefix to every image prompt."""
-    return f"{CHARACTER_PREFIX}{scene_image_prompt}"
+def build_image_prompt(scene_image_prompt: str, equipment: str = "") -> str:
+    eq = f"Equipment shown must be {equipment}. " if equipment else ""
+    return f"{CHARACTER_PREFIX}{eq}{scene_image_prompt}"

@@ -34,6 +34,7 @@ def synthesize(
 
 
 def _google_tts(text: str, voice: str) -> bytes:
+    import config as _cfg
     client = texttospeech.TextToSpeechClient()
     synthesis_input = texttospeech.SynthesisInput(text=text)
     voice_params = texttospeech.VoiceSelectionParams(
@@ -41,7 +42,8 @@ def _google_tts(text: str, voice: str) -> bytes:
         name=voice,
     )
     audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3
+        audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+        sample_rate_hertz=_cfg.TTS_SAMPLE_RATE,
     )
     response = client.synthesize_speech(
         input=synthesis_input,

@@ -7,7 +7,7 @@ from docx import Document
 
 import config
 from models.scene_manifest import SopJson
-from prompts.script_prompt import SYSTEM_PROMPT
+from prompts.script_prompt import build_system_prompt
 
 
 class ParseError(Exception):
@@ -60,7 +60,8 @@ def _gemini_structure(raw_text: str) -> dict:
     from google import genai
     from google.genai import types
     client = genai.Client(api_key=config.GEMINI_API_KEY)
-    gen_config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+    system_prompt = build_system_prompt("")
+    gen_config = types.GenerateContentConfig(system_instruction=system_prompt)
     prompt = f"""다음 SOP 원문을 분석하여 JSON으로 구조화하세요.
 
 원문:
@@ -73,7 +74,8 @@ def _gemini_structure(raw_text: str) -> dict:
   "hazards": [{{"id": "H1", "name": "string", "severity": "string"}}],
   "procedure_steps": [{{"step": 1, "action": "string", "key_rules": ["string"]}}],
   "target_audience": "string",
-  "common_violations": ["string"]
+  "common_violations": ["string"],
+  "equipment_type": "장비명을 영문 보조 표기와 함께 구체적으로 (예: '고소작업차 (vehicle-mounted boom lift with outriggers)'). SOP에 특정 장비가 없으면 null."
 }}"""
 
     for attempt in range(config.MAX_RETRY + 1):

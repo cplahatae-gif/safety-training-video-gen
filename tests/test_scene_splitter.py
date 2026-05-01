@@ -29,7 +29,7 @@ def test_split_scenes_creates_manifest_and_audio(tmp_path):
     with patch("pipeline.scene_splitter.synthesize") as mock_tts:
         mock_tts.side_effect = [
             (b"AUDIO01", 5.0),
-            (b"AUDIO02", 9.2),
+            (b"AUDIO02", 12.5),
         ]
         with patch("pipeline.scene_splitter._split_audio_file") as mock_split:
             manifest = split_scenes(
@@ -52,8 +52,8 @@ def test_split_scenes_creates_manifest_and_audio(tmp_path):
     assert mock_split.call_count == 2
     calls = mock_split.call_args_list
     assert calls[0].kwargs["start"] == 0
-    assert calls[0].kwargs["length"] == 8
-    assert calls[1].kwargs["start"] == 8
+    assert calls[0].kwargs["length"] == 10
+    assert calls[1].kwargs["start"] == 10
     assert calls[1].kwargs["length"] is None
 
 

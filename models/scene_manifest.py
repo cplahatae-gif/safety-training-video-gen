@@ -73,3 +73,4 @@ class SopJson(BaseModel):
     procedure_steps: list[ProcedureStep]
     target_audience: str
     common_violations: list[str]
+    equipment_type: Optional[str] = None

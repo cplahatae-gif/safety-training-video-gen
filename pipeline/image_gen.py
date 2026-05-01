@@ -1,5 +1,6 @@
 from __future__ import annotations
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -13,6 +14,7 @@ console = Console()
 
 THROTTLE_MAX_RETRIES = 5
 _RESET_RE = re.compile(r"resets in\s*~?(\d+)s")
+_SUBSCENE_RE = re.compile(r"^(S\d+)[a-z]$")  # matches S02a, S03b → parent group S02
 
 
 def _throttle_sleep_seconds(exc: Exception) -> int | None:
@@ -33,18 +35,45 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
         else config.DEFAULT_IMAGE_MODEL
     )
 
+    # Track first-generated image per parent group for sub-scene reuse
+    # Key: parent prefix (e.g. "S02"), Value: Path to existing PNG
+    parent_images: dict[str, Path] = {}
+
     for scene in manifest.scenes:
         if scene.status == SceneStatus.skipped:
             continue
         if scene.status in (SceneStatus.image_ready, SceneStatus.clip_ready,
                              SceneStatus.merged_ready, SceneStatus.assembled):
-            console.print(f"[dim]Skip {scene.scene_id} - already at {scene.status}[/dim]")
+            console.print(f"[dim]Skip {scene.scene_id} — already at {scene.status}[/dim]")
+            # Still register in parent_images for downstream sub-scenes
+            out_path = images_dir / f"{scene.scene_id}.png"
+            if out_path.exists():
+                m = _SUBSCENE_RE.match(scene.scene_id)
+                prefix = m.group(1) if m else scene.scene_id
+                parent_images.setdefault(prefix, out_path)
             continue
 
         out_path = images_dir / f"{scene.scene_id}.png"
+
+        # Sub-scene: reuse first sub-scene's image if already generated
+        m = _SUBSCENE_RE.match(scene.scene_id)
+        if m:
+            prefix = m.group(1)
+            if prefix in parent_images:
+                console.print(f"[dim]Reuse {parent_images[prefix].name} for sub-scene {scene.scene_id}[/dim]")
+                shutil.copy2(parent_images[prefix], out_path)
+                scene.status = SceneStatus.image_ready
+                manifest.save(workspace)
+                continue
+
         success = _generate_with_retry(scene.image_prompt, out_path, model)
         if success:
             scene.status = SceneStatus.image_ready
+            # Register as parent reference for subsequent sub-scenes
+            if m:
+                parent_images.setdefault(m.group(1), out_path)
+            else:
+                parent_images.setdefault(scene.scene_id, out_path)
         else:
             scene.status = SceneStatus.skipped
             console.print(f"[yellow]Warning: image gen failed for {scene.scene_id}, skipping[/yellow]")

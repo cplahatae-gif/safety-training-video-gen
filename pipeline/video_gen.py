@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 
@@ -26,6 +27,27 @@ def _throttle_sleep_seconds(exc: Exception) -> int | None:
     return (int(match.group(1)) + 1) if match else 10
 
 
+def _extract_last_frame(clip_path: Path, out_path: Path) -> bool:
+    """Extract the last frame of a clip for Kling start_image chaining."""
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-sseof", "-0.5",
+                "-i", str(clip_path),
+                "-vframes", "1",
+                "-q:v", "2",
+                str(out_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return out_path.exists() and out_path.stat().st_size > 0
+    except Exception as exc:
+        console.print(f"[dim]Last-frame extract failed for {clip_path.name}: {exc}[/dim]")
+        return False
+
+
 def generate_videos(manifest: SceneManifest, workspace: Path) -> SceneManifest:
     clips_dir = workspace / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
@@ -43,17 +65,34 @@ def generate_videos(manifest: SceneManifest, workspace: Path) -> SceneManifest:
             if answer != "y":
                 raise SystemExit("Aborted by user.")
 
+    prev_clip_path: Path | None = None
+
     for scene in manifest.scenes:
         if scene.status != SceneStatus.image_ready:
+            # Advance prev_clip if already generated
+            candidate = clips_dir / f"{scene.scene_id}.mp4"
+            if candidate.exists():
+                prev_clip_path = candidate
             continue
 
         img_path = images_dir / f"{scene.scene_id}.png"
         clip_path = clips_dir / f"{scene.scene_id}.mp4"
 
-        success = _generate_with_retry(scene, img_path, clip_path)
+        # Prefer last-frame of previous clip as start_image for temporal continuity
+        start_image_path = img_path
+        if prev_clip_path is not None and prev_clip_path.exists():
+            last_frame = images_dir / f"_lastframe_{prev_clip_path.stem}.png"
+            if not last_frame.exists():
+                _extract_last_frame(prev_clip_path, last_frame)
+            if last_frame.exists():
+                start_image_path = last_frame
+                console.print(f"[dim]Kling start_image: last frame of {prev_clip_path.stem}[/dim]")
+
+        success = _generate_with_retry(scene, start_image_path, clip_path)
 
         if success:
             scene.status = SceneStatus.clip_ready
+            prev_clip_path = clip_path
         else:
             scene.status = SceneStatus.skipped
             console.print(f"[yellow]Warning: video gen failed for {scene.scene_id}, skipping[/yellow]")

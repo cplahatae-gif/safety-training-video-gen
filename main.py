@@ -151,6 +151,7 @@ def _run_stages(
             video_style="shortform" if args.duration <= 30 else "hybrid",
             sop_title=sop["sop_title"],
             duration=args.duration,
+            equipment_type=sop.get("equipment_type") or "",
         )
         if args.dry_run:
             console.print(manifest.model_dump_json(indent=2))
@@ -190,7 +191,7 @@ def _run_tts_stage(manifest: SceneManifest, workspace: Path) -> None:
     for scene in manifest.scenes:
         if scene.status == SceneStatus.skipped:
             continue
-        audio_path = audio_dir / f"{scene.scene_id}.mp3"
+        audio_path = audio_dir / f"{scene.scene_id}.wav"
         if audio_path.exists():
             console.print(f"[dim]Skip TTS {scene.scene_id} - already exists[/dim]")
             continue
@@ -207,7 +208,7 @@ def _run_tts_stage(manifest: SceneManifest, workspace: Path) -> None:
             text=scene.narration_ko,
             provider=manifest.tts_provider or "google",
             voice=manifest.tts_voice or "ko-KR-Wavenet-B",
-            output_path=audio_path,
+            output_path=audio_path,  # .wav
         )
         if scene.status not in (SceneStatus.clip_ready, SceneStatus.assembled):
             scene.status = SceneStatus.audio_ready

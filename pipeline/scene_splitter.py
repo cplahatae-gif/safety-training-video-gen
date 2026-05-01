@@ -10,6 +10,7 @@ from prompts.scene_prompt import build_image_prompt
 
 DEFAULT_PROVIDER = "google"
 DEFAULT_VOICE = "ko-KR-Wavenet-B"
+KLING_MAX_DUR = 10  # Kling maximum clip duration; split only if narration exceeds this
 
 
 def split_scenes(
@@ -18,8 +19,9 @@ def split_scenes(
     video_style: str,
     sop_title: str,
     duration: int,
+    equipment_type: str = "",
 ) -> SceneManifest:
-    """Synthesize TTS per scene, split >8s scenes, write manifest.json."""
+    """Synthesize TTS per scene, split >10s scenes, write manifest.json."""
     audio_dir = workspace / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
 
@@ -33,7 +35,7 @@ def split_scenes(
         provider = tts_provider or DEFAULT_PROVIDER
         voice = tts_voice or DEFAULT_VOICE
 
-        audio_path = audio_dir / f"{scene_id}.mp3"
+        audio_path = audio_dir / f"{scene_id}.wav"
         _, dur_sec = synthesize(
             text=narration,
             provider=provider,
@@ -47,23 +49,23 @@ def split_scenes(
 
         duration_sec = math.ceil(dur_sec)
 
-        if duration_sec <= 8:
-            scenes.append(_make_scene(raw, scene_id, duration_sec))
+        if duration_sec <= KLING_MAX_DUR:
+            scenes.append(_make_scene(raw, scene_id, duration_sec, equipment_type))
         else:
             offset = 0
             suffix_idx = 0
             while offset < duration_sec:
-                chunk_dur = min(8, duration_sec - offset)
+                chunk_dur = min(KLING_MAX_DUR, duration_sec - offset)
                 suffix = chr(ord('a') + suffix_idx)
                 sub_id = f"{scene_id}{suffix}"
-                sub_audio = audio_dir / f"{sub_id}.mp3"
+                sub_audio = audio_dir / f"{sub_id}.wav"
                 is_last = (offset + chunk_dur >= duration_sec)
                 _split_audio_file(
                     audio_path, sub_audio,
                     start=offset,
                     length=None if is_last else chunk_dur,
                 )
-                scenes.append(_make_scene(raw, sub_id, chunk_dur))
+                scenes.append(_make_scene(raw, sub_id, chunk_dur, equipment_type))
                 offset += chunk_dur
                 suffix_idx += 1
 
@@ -82,14 +84,14 @@ def split_scenes(
     return manifest
 
 
-def _make_scene(raw: dict, scene_id: str, duration_sec: int) -> Scene:
+def _make_scene(raw: dict, scene_id: str, duration_sec: int, equipment_type: str) -> Scene:
     return Scene(
         scene_id=scene_id,
         act=raw["act"],
         duration_sec=duration_sec,
         status=SceneStatus.audio_ready,
         narration_ko=raw["narration_ko"],
-        image_prompt=build_image_prompt(raw["image_prompt"]),
+        image_prompt=build_image_prompt(raw["image_prompt"], equipment=equipment_type),
         motion_prompt=raw["motion_prompt"],
         camera=raw["camera"],
         mood=raw["mood"],
