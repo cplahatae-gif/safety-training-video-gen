@@ -9,7 +9,7 @@ from rich.console import Console
 
 import config
 from models.scene_manifest import SceneManifest, SceneStatus
-from pipeline.tts import _audio_duration
+from pipeline.tts import _audio_duration, synthesize
 
 console = Console()
 
@@ -60,6 +60,83 @@ def _subtitle_vf(text: str, font_path: str) -> str:
         f":x=(w-text_w)/2"
         f":y=h-text_h-80"
     )
+
+
+def _generate_outro_clip(tmp_dir: Path) -> Path | None:
+    """Generate outro clip from OUTRO_NARRATION text + optional OUTRO_IMAGE.
+
+    Returns path to outro .mp4, or None if OUTRO_NARRATION is not configured.
+    Uses ffmpeg lavfi dark card if OUTRO_IMAGE is not provided.
+    """
+    outro_text = config.OUTRO_NARRATION
+    if not outro_text:
+        return None
+
+    outro_clip = tmp_dir / "_outro.mp4"
+    if outro_clip.exists() and outro_clip.stat().st_size >= 1024:
+        return outro_clip
+
+    # Synthesize narration
+    outro_audio = tmp_dir / "_outro.wav"
+    if not (outro_audio.exists() and outro_audio.stat().st_size > 1000):
+        try:
+            synthesize(
+                text=outro_text,
+                provider=config.OUTRO_TTS_PROVIDER,
+                voice=config.OUTRO_TTS_VOICE,
+                output_path=outro_audio,
+            )
+        except Exception as exc:
+            console.print(f"[yellow]Outro TTS failed: {exc} — skipping outro[/yellow]")
+            return None
+
+    audio_dur = _audio_duration(outro_audio)
+
+    outro_img = config.OUTRO_IMAGE
+    if outro_img and Path(outro_img).exists():
+        # Use user-provided image
+        _run_ffmpeg(
+            [
+                "ffmpeg", "-y",
+                "-loop", "1", "-i", outro_img,
+                "-i", str(outro_audio),
+                "-t", str(audio_dur),
+                "-vf", "scale=1920:1080,fade=t=in:st=0:d=0.3",
+                "-c:v", "libx264", "-preset", "fast",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+                "-shortest",
+                str(outro_clip),
+            ],
+            stage="outro",
+        )
+    else:
+        # Auto-generate dark card with drawtext
+        font_path = config.SUBTITLE_FONT_PATH.replace("\\", "/").replace(":", "\\:")
+        safe_text = _escape_drawtext("안전수칙 준수, 우리 모두의 책임")
+        drawtext_vf = (
+            f"fade=t=in:st=0:d=0.3,"
+            f"drawtext=fontfile='{font_path}'"
+            f":text='{safe_text}'"
+            f":fontsize=64:fontcolor=white"
+            f":borderw=3:bordercolor=black@0.8"
+            f":x=(w-text_w)/2:y=(h-text_h)/2"
+        )
+        _run_ffmpeg(
+            [
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", "color=c=0x1a1a2e:s=1920x1080:r=24",
+                "-i", str(outro_audio),
+                "-t", str(audio_dur),
+                "-vf", drawtext_vf,
+                "-c:v", "libx264", "-preset", "fast",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+                "-shortest",
+                str(outro_clip),
+            ],
+            stage="outro",
+        )
+
+    return outro_clip
 
 
 def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path:
@@ -154,6 +231,13 @@ def assemble(manifest: SceneManifest, workspace: Path, output_dir: Path) -> Path
         tmp_dir / f"{s.scene_id}_merged.mp4"
         for s in assemblable
     ]
+
+    # Append outro clip if configured
+    outro_clip = _generate_outro_clip(tmp_dir)
+    if outro_clip:
+        merged_paths.append(outro_clip)
+        console.print(f"[dim]Outro clip appended ({outro_clip.name})[/dim]")
+
     concat_list = tmp_dir / "concat.txt"
     concat_list.write_text(
         "\n".join(f"file '{p.resolve().as_posix()}'" for p in merged_paths),
