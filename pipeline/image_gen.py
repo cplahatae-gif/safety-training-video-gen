@@ -25,7 +25,14 @@ def _throttle_sleep_seconds(exc: Exception) -> int | None:
     return (int(match.group(1)) + 1) if match else 10
 
 
-def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
+def generate_images(manifest: SceneManifest, workspace: Path, domain: str = "industrial", equipment_hint: str = "") -> SceneManifest:
+    """Generate scene images.
+
+    If `domain` is provided, generates a multi-angle character reference sheet
+    (CharacterAgent) and uses pose-specific references per scene. This replaces
+    the previous "first scene becomes ref" approach which had identity drift.
+    Falls back to legacy behavior if sheet generation fails.
+    """
     images_dir = workspace / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
@@ -39,13 +46,29 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
     # Track first-generated image per parent group for sub-scene reuse
     parent_images: dict[str, Path] = {}
 
-    # Reference image: first eligible scene's PNG, used for character consistency
+    # Try to generate a character reference sheet (Identity Anchoring)
+    # If sheet generation fails, fall back to legacy single-ref behavior.
+    character_sheet: dict = {}
+    use_sheet = False
+    try:
+        import os
+        if os.environ.get("DISABLE_CHARACTER_SHEET") != "1":
+            from pipeline.agents.character_agent import CharacterAgent
+            agent = CharacterAgent(domain=domain, workspace=workspace, equipment_hint=equipment_hint)
+            character_sheet = agent.prepare()
+            if character_sheet:
+                use_sheet = True
+                console.print(f"[green]Character sheet ready ({len(character_sheet)} poses)[/green]")
+    except Exception as exc:
+        console.print(f"[yellow]Character sheet generation failed: {exc} — using legacy ref[/yellow]")
+
+    # Legacy reference image (used when sheet not available)
     ref_path: Path | None = None
     ref_path_candidate = images_dir / "_reference.png"
     if ref_path_candidate.exists():
         ref_path = ref_path_candidate
 
-    is_first_scene = ref_path is None
+    is_first_scene = ref_path is None and not use_sheet
 
     for scene in manifest.scenes:
         if scene.status == SceneStatus.skipped:
@@ -76,8 +99,18 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
                 manifest.save(workspace)
                 continue
 
+        # Pick a reference image for this scene
+        scene_ref_path: Path | None = None
+        if use_sheet:
+            from pipeline.agents.character_agent import select_for_scene
+            scene_ref_path = select_for_scene({"scene_id": scene.scene_id, "act": scene.act}, character_sheet)
+            if scene_ref_path:
+                console.print(f"[dim]{scene.scene_id}: using sheet pose '{scene_ref_path.stem}'[/dim]")
+        else:
+            scene_ref_path = ref_path  # legacy single-ref
+
         if is_first_scene:
-            # Generate reference image with base model (fast), save as _reference.png + scene PNG
+            # Legacy first-scene path (used only when character sheet unavailable)
             console.print(f"[dim]Generating reference image for {scene.scene_id} ({base_model})[/dim]")
             success = _generate_with_retry(scene.image_prompt, ref_path_candidate, base_model)
             if success:
@@ -86,14 +119,16 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
                 is_first_scene = False
             else:
                 success = False
-        else:
-            # Use reference model with reference image for character/equipment consistency
+        elif scene_ref_path:
+            # Use reference model with the chosen reference (sheet pose or legacy)
             console.print(f"[dim]Generating {scene.scene_id} with reference ({ref_model})[/dim]")
-            success = _generate_ref_with_retry(scene.image_prompt, ref_path, out_path, ref_model)
+            success = _generate_ref_with_retry(scene.image_prompt, scene_ref_path, out_path, ref_model)
             if not success:
-                # Fallback to base model without reference
                 console.print(f"[yellow]Ref model failed for {scene.scene_id}, falling back to {base_model}[/yellow]")
                 success = _generate_with_retry(scene.image_prompt, out_path, base_model)
+        else:
+            # No reference at all — pure text-to-image
+            success = _generate_with_retry(scene.image_prompt, out_path, base_model)
 
         if success:
             scene.status = SceneStatus.image_ready

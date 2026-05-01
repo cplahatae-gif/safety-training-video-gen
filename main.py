@@ -165,6 +165,7 @@ def _run_stages(
             sop_title=sop["sop_title"],
             duration=args.duration,
             equipment_type=sop.get("equipment_type") or "",
+            domain=sop.get("domain") or "industrial",
         )
         if args.dry_run:
             console.print(manifest.model_dump_json(indent=2))
@@ -183,7 +184,12 @@ def _run_stages(
 
     if start <= 4 <= end:
         console.rule("[bold]Stage 4: Image Generator[/bold]")
-        manifest = generate_images(manifest=manifest, workspace=workspace)
+        manifest = generate_images(
+            manifest=manifest,
+            workspace=workspace,
+            domain=sop.get("domain") or "industrial",
+            equipment_hint=sop.get("equipment_type") or "",
+        )
         if getattr(args, "validate", False):
             result = validate_stage4(workspace)
             print_result(result)

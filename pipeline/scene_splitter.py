@@ -20,8 +20,13 @@ def split_scenes(
     sop_title: str,
     duration: int,
     equipment_type: str = "",
+    domain: str = "industrial",
 ) -> SceneManifest:
-    """Synthesize TTS per scene, split >10s scenes, write manifest.json."""
+    """Synthesize TTS per scene, split >10s scenes, write manifest.json.
+
+    `domain` controls the character prefix used in image_prompt
+    (industrial / lab / medical / chemical / construction / general).
+    """
     audio_dir = workspace / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
 
@@ -50,7 +55,7 @@ def split_scenes(
         duration_sec = math.ceil(dur_sec)
 
         if duration_sec <= KLING_MAX_DUR:
-            scenes.append(_make_scene(raw, scene_id, duration_sec, equipment_type))
+            scenes.append(_make_scene(raw, scene_id, duration_sec, equipment_type, domain))
         else:
             offset = 0
             suffix_idx = 0
@@ -65,7 +70,7 @@ def split_scenes(
                     start=offset,
                     length=None if is_last else chunk_dur,
                 )
-                scenes.append(_make_scene(raw, sub_id, chunk_dur, equipment_type))
+                scenes.append(_make_scene(raw, sub_id, chunk_dur, equipment_type, domain))
                 offset += chunk_dur
                 suffix_idx += 1
 
@@ -84,14 +89,14 @@ def split_scenes(
     return manifest
 
 
-def _make_scene(raw: dict, scene_id: str, duration_sec: int, equipment_type: str) -> Scene:
+def _make_scene(raw: dict, scene_id: str, duration_sec: int, equipment_type: str, domain: str = "industrial") -> Scene:
     return Scene(
         scene_id=scene_id,
         act=raw["act"],
         duration_sec=duration_sec,
         status=SceneStatus.audio_ready,
         narration_ko=raw["narration_ko"],
-        image_prompt=build_image_prompt(raw["image_prompt"], equipment=equipment_type),
+        image_prompt=build_image_prompt(raw["image_prompt"], equipment=equipment_type, domain=domain),
         motion_prompt=raw["motion_prompt"],
         camera=raw["camera"],
         mood=raw["mood"],

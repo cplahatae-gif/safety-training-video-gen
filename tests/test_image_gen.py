@@ -6,6 +6,16 @@ from pipeline.image_gen import generate_images
 from models.scene_manifest import Scene, SceneManifest, SceneStatus
 
 
+@pytest.fixture(autouse=True)
+def _disable_character_sheet_by_default(monkeypatch, request):
+    """Default: tests skip character sheet (legacy ref path).
+    Tests that explicitly want sheet behavior should override with --override-ini or remove DISABLE_CHARACTER_SHEET.
+    """
+    if "use_sheet" in request.keywords:
+        return  # marker overrides the default
+    monkeypatch.setenv("DISABLE_CHARACTER_SHEET", "1")
+
+
 def _make_manifest(tmp_path: Path) -> SceneManifest:
     return SceneManifest(
         sop_title="테스트", total_duration_sec=8,
@@ -43,8 +53,12 @@ def test_generate_images_saves_png_and_updates_status(tmp_path):
     assert updated.scenes[0].status == SceneStatus.image_ready
 
 
-def test_generate_images_uses_ref_model_for_second_scene(tmp_path):
-    """First scene uses base model and saves _reference.png; second uses REF_IMAGE_MODEL."""
+def test_generate_images_uses_ref_model_for_second_scene(tmp_path, monkeypatch):
+    """Legacy path: first scene uses base model and saves _reference.png; second uses REF_IMAGE_MODEL.
+
+    Sets DISABLE_CHARACTER_SHEET=1 to bypass the new CharacterAgent path.
+    """
+    monkeypatch.setenv("DISABLE_CHARACTER_SHEET", "1")
     manifest = SceneManifest(
         sop_title="테스트", total_duration_sec=14,
         video_style="hybrid", tts_provider="google", tts_voice="ko-KR-Wavenet-B",
@@ -85,6 +99,50 @@ def test_generate_images_uses_ref_model_for_second_scene(tmp_path):
     calls = mock_run.call_args_list
     assert calls[0][0][0] == _cfg.DEFAULT_IMAGE_MODEL
     assert calls[1][0][0] == "black-forest-labs/flux-1.1-pro"
+
+
+@pytest.mark.use_sheet
+def test_generate_images_uses_character_sheet_when_enabled(tmp_path):
+    """New path: CharacterAgent generates sheet, scenes use sheet poses as references."""
+    manifest = SceneManifest(
+        sop_title="테스트", total_duration_sec=10,
+        video_style="hybrid", tts_provider="google", tts_voice="ko-KR-Wavenet-B",
+        scenes=[
+            Scene(
+                scene_id="S01", act="hook", duration_sec=5,
+                status=SceneStatus.audio_ready,
+                narration_ko="씬 1", image_prompt="lab interior",
+                motion_prompt="pan", camera="wide", mood="calm",
+            ),
+            Scene(
+                scene_id="S02", act="resolution", duration_sec=5,
+                status=SceneStatus.audio_ready,
+                narration_ko="씬 2", image_prompt="researcher aligning",
+                motion_prompt="track", camera="close", mood="instructive",
+            ),
+        ],
+    )
+    workspace = tmp_path / "ws"
+    (workspace / "images").mkdir(parents=True)
+
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    fake_file = MagicMock()
+    fake_file.read.return_value = fake_png
+
+    with patch("pipeline.image_gen.replicate.run") as mock_run, \
+         patch("pipeline.agents.character_agent.replicate.run") as mock_sheet_run:
+        mock_run.return_value = [fake_file]
+        mock_sheet_run.return_value = [fake_file]
+        updated = generate_images(manifest=manifest, workspace=workspace, domain="lab")
+
+    # Character sheet directory should exist
+    assert (workspace / "character_sheet").exists()
+    # Scene images should exist
+    assert (workspace / "images" / "S01.png").exists()
+    assert (workspace / "images" / "S02.png").exists()
+    # Both scenes should have image_ready status
+    assert updated.scenes[0].status == SceneStatus.image_ready
+    assert updated.scenes[1].status == SceneStatus.image_ready
 
 
 def test_generate_images_skips_scene_after_two_failures(tmp_path):
