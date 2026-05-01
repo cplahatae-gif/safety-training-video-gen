@@ -66,6 +66,18 @@ class ProcedureStep(BaseModel):
     key_rules: list[str]
 
 
+_DOMAIN_LITERAL = Literal["industrial", "lab", "medical", "chemical", "construction", "general"]
+
+
+class DeepExtract(BaseModel):
+    """Detail-rich information extracted from SOP for richer scenario generation."""
+    specific_hazards: list[str] = []
+    specific_procedures: list[str] = []
+    equipment_details: list[str] = []
+    injury_types: list[str] = []
+    thresholds: list[str] = []
+
+
 class SopJson(BaseModel):
     sop_title: str = Field(pattern=_SOP_TITLE_PATTERN)
     legal_basis: list[str]
@@ -74,3 +86,5 @@ class SopJson(BaseModel):
     target_audience: str
     common_violations: list[str]
     equipment_type: Optional[str] = None
+    domain: _DOMAIN_LITERAL = "general"
+    deep_extract: Optional[DeepExtract] = None

@@ -34,6 +34,16 @@ def parse_sop(sop_path: Path, run_workspace: Path) -> dict:
     except Exception as exc:
         raise ParseError(f"SOP schema validation failed: {exc}") from exc
 
+    # Enrich with domain detection + deep extraction (skipped if USE_LEGACY_SCRIPT=1)
+    import os
+    if os.environ.get("USE_LEGACY_SCRIPT") != "1":
+        try:
+            from pipeline.agents.sop_extractor import enrich_sop
+            sop_data = enrich_sop(sop_data)
+        except Exception as exc:
+            # Enrichment is optional — continue with base SOP if it fails
+            print(f"[warn] SOP enrichment failed: {exc}")
+
     run_workspace.mkdir(parents=True, exist_ok=True)
     (run_workspace / "sop.json").write_text(
         json.dumps(sop_data, ensure_ascii=False, indent=2), encoding="utf-8"

@@ -4,6 +4,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pipeline.sop_parser import parse_sop, ParseError
 
+
+@pytest.fixture(autouse=True)
+def disable_enrichment(monkeypatch):
+    """Skip Gemini-based domain detection + deep extraction in unit tests."""
+    monkeypatch.setenv("USE_LEGACY_SCRIPT", "1")
+
 EXPECTED_SOP = {
     "sop_title": "테스트 SOP",
     "legal_basis": [],

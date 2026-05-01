@@ -1,7 +1,14 @@
 import json
+import os
 from unittest.mock import MagicMock, patch
 import pytest
 from pipeline.script_gen import generate_script
+
+
+@pytest.fixture(autouse=True)
+def use_legacy_script(monkeypatch):
+    """Force legacy one-shot path for these tests; ScenarioAgent has its own test file."""
+    monkeypatch.setenv("USE_LEGACY_SCRIPT", "1")
 
 FAKE_SCENES = [
     {

@@ -1,5 +1,11 @@
+"""Script generation entrypoint.
+
+By default, routes to the new ScenarioAgent (research-backed plan-then-generate).
+Set USE_LEGACY_SCRIPT=1 to use the original one-shot Gemini call.
+"""
 from __future__ import annotations
 import json
+import os
 
 from google import genai
 from google.genai import types
@@ -19,7 +25,20 @@ class ScriptError(RuntimeError):
 
 
 def generate_script(sop: dict, duration: int) -> list[dict]:
-    """Call Gemini to generate a list of scene dicts from SOP JSON."""
+    """Generate scene list from SOP. Routes to ScenarioAgent unless USE_LEGACY_SCRIPT=1."""
+    if os.environ.get("USE_LEGACY_SCRIPT") == "1":
+        return _generate_script_legacy(sop, duration)
+
+    # Default: new agent-based path
+    from pipeline.agents.scenario_agent import generate_script_v2
+    return generate_script_v2(sop, duration)
+
+
+# ─── Legacy implementation (kept for backwards compat / testing) ─────────────
+
+
+def _generate_script_legacy(sop: dict, duration: int) -> list[dict]:
+    """Original one-shot Gemini call. Kept for fallback and existing tests."""
     equipment_type = sop.get("equipment_type") or ""
     client = genai.Client(api_key=config.GEMINI_API_KEY)
     system_prompt = build_system_prompt(equipment_type)
