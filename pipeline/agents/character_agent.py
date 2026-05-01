@@ -100,15 +100,15 @@ def generate_sheet(
         out_path = sheet_dir / f"{pose_id}.png"
         if out_path.exists() and out_path.stat().st_size > 1024:
             sheet[pose_id] = out_path
-            console.print(f"[dim]  ✓ {pose_id} (cached)[/dim]")
+            console.print(f"[dim]  ok {pose_id} (cached)[/dim]")
             continue
 
         prompt = build_character_sheet_prompt(domain, pose, env_hint)
         if _generate_one_pose(prompt, out_path):
             sheet[pose_id] = out_path
-            console.print(f"[dim]  ✓ {pose_id}[/dim]")
+            console.print(f"[dim]  ok {pose_id}[/dim]")
         else:
-            console.print(f"[yellow]  ✗ {pose_id} failed (skipped)[/yellow]")
+            console.print(f"[yellow]  fail {pose_id} (skipped)[/yellow]")
 
     if not sheet:
         console.print(
