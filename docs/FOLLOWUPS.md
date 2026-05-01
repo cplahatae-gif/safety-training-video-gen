@@ -10,7 +10,7 @@
 
 ### [ ] Replicate API 토큰 로테이션
 - **이유:** 유출 시 이미지/영상 생성으로 **실제 과금 발생** ($0.05/초 등). 우선순위 높음.
-- **기존 토큰:** `[REDACTED]` (유출 가정)
+- **기존 토큰:** `[REDACTED — ~/.secrets/safety-video-gen/.env 참조]` (유출 가정)
 - **절차:**
   1. https://replicate.com/account/api-tokens 접속
   2. 기존 토큰 **Revoke**
@@ -20,7 +20,7 @@
 
 ### [ ] Gemini API 키 로테이션
 - **이유:** 무료 티어라 과금 위험 낮음. 하지만 quota 남용 가능 + 어차피 교체 비용 0에 가까움.
-- **기존 키:** `[REDACTED]` (유출 가정)
+- **기존 키:** `[REDACTED — ~/.secrets/safety-video-gen/.env 참조]` (유출 가정)
 - **절차:**
   1. https://aistudio.google.com/apikey 접속
   2. 기존 키 옆 **Delete**
