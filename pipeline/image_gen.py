@@ -29,15 +29,23 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
     images_dir = workspace / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
-    model = (
+    base_model = (
         "black-forest-labs/flux-dev"
         if config.USE_FLUX_DEV
         else config.DEFAULT_IMAGE_MODEL
     )
+    ref_model = config.REF_IMAGE_MODEL
 
     # Track first-generated image per parent group for sub-scene reuse
-    # Key: parent prefix (e.g. "S02"), Value: Path to existing PNG
     parent_images: dict[str, Path] = {}
+
+    # Reference image: first eligible scene's PNG, used for character consistency
+    ref_path: Path | None = None
+    ref_path_candidate = images_dir / "_reference.png"
+    if ref_path_candidate.exists():
+        ref_path = ref_path_candidate
+
+    is_first_scene = ref_path is None
 
     for scene in manifest.scenes:
         if scene.status == SceneStatus.skipped:
@@ -45,17 +53,19 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
         if scene.status in (SceneStatus.image_ready, SceneStatus.clip_ready,
                              SceneStatus.merged_ready, SceneStatus.assembled):
             console.print(f"[dim]Skip {scene.scene_id} — already at {scene.status}[/dim]")
-            # Still register in parent_images for downstream sub-scenes
             out_path = images_dir / f"{scene.scene_id}.png"
             if out_path.exists():
                 m = _SUBSCENE_RE.match(scene.scene_id)
                 prefix = m.group(1) if m else scene.scene_id
                 parent_images.setdefault(prefix, out_path)
+            if ref_path is None and out_path.exists():
+                ref_path = out_path
+                is_first_scene = False
             continue
 
         out_path = images_dir / f"{scene.scene_id}.png"
 
-        # Sub-scene: reuse first sub-scene's image if already generated
+        # Sub-scene: reuse first sub-scene's image (no extra FLUX call)
         m = _SUBSCENE_RE.match(scene.scene_id)
         if m:
             prefix = m.group(1)
@@ -66,10 +76,27 @@ def generate_images(manifest: SceneManifest, workspace: Path) -> SceneManifest:
                 manifest.save(workspace)
                 continue
 
-        success = _generate_with_retry(scene.image_prompt, out_path, model)
+        if is_first_scene:
+            # Generate reference image with base model (fast), save as _reference.png + scene PNG
+            console.print(f"[dim]Generating reference image for {scene.scene_id} ({base_model})[/dim]")
+            success = _generate_with_retry(scene.image_prompt, ref_path_candidate, base_model)
+            if success:
+                ref_path = ref_path_candidate
+                shutil.copy2(ref_path, out_path)
+                is_first_scene = False
+            else:
+                success = False
+        else:
+            # Use reference model with reference image for character/equipment consistency
+            console.print(f"[dim]Generating {scene.scene_id} with reference ({ref_model})[/dim]")
+            success = _generate_ref_with_retry(scene.image_prompt, ref_path, out_path, ref_model)
+            if not success:
+                # Fallback to base model without reference
+                console.print(f"[yellow]Ref model failed for {scene.scene_id}, falling back to {base_model}[/yellow]")
+                success = _generate_with_retry(scene.image_prompt, out_path, base_model)
+
         if success:
             scene.status = SceneStatus.image_ready
-            # Register as parent reference for subsequent sub-scenes
             if m:
                 parent_images.setdefault(m.group(1), out_path)
             else:
@@ -111,5 +138,39 @@ def _generate_with_retry(prompt: str, out_path: Path, model: str) -> bool:
                 continue
             if attempt == config.MAX_RETRY:
                 console.print(f"[red]Image gen error: {exc}[/red]")
+                return False
+    return False
+
+
+def _generate_ref_with_retry(prompt: str, ref_path: Path, out_path: Path, model: str) -> bool:
+    """Generate image using flux-1.1-pro with a reference image for consistency."""
+    throttle_retries = 0
+    for attempt in range(config.MAX_RETRY + 1):
+        try:
+            with open(ref_path, "rb") as ref_file:
+                output = replicate.run(
+                    model,
+                    input={
+                        "prompt": prompt,
+                        "aspect_ratio": "16:9",
+                        "output_format": "png",
+                        "image_prompt": ref_file,
+                        "image_prompt_strength": 0.15,
+                    },
+                )
+            data = output[0].read()
+            if not data:
+                raise ValueError(f"empty image response from {model}")
+            out_path.write_bytes(data)
+            return True
+        except Exception as exc:
+            sleep_s = _throttle_sleep_seconds(exc)
+            if sleep_s is not None and throttle_retries < THROTTLE_MAX_RETRIES:
+                throttle_retries += 1
+                console.print(f"[dim]429 throttled - sleeping {sleep_s}s (retry {throttle_retries}/{THROTTLE_MAX_RETRIES})[/dim]")
+                time.sleep(sleep_s)
+                continue
+            if attempt == config.MAX_RETRY:
+                console.print(f"[red]Ref image gen error: {exc}[/red]")
                 return False
     return False

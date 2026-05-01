@@ -9,7 +9,7 @@ def _make_ready_manifest(workspace: Path) -> SceneManifest:
     (workspace / "clips").mkdir(parents=True)
     (workspace / "audio").mkdir(parents=True)
     (workspace / "clips" / "S01.mp4").write_bytes(b"\x00" * 100)
-    (workspace / "audio" / "S01.mp3").write_bytes(b"\x00" * 100)
+    (workspace / "audio" / "S01.wav").write_bytes(b"\x00" * 100)
 
     return SceneManifest(
         sop_title="테스트 SOP", total_duration_sec=8,
@@ -32,16 +32,27 @@ def test_assemble_calls_ffmpeg_and_returns_output_path(tmp_path):
     manifest = _make_ready_manifest(workspace)
 
     fake_output = output_dir / "result.mp4"
-    fake_output.write_bytes(b"\x00" * 10)
 
-    with patch("pipeline.assembler.subprocess.run") as mock_run, \
+    def _fake_ffmpeg(cmd, **kwargs):
+        # Create whatever output file ffmpeg would have produced
+        for i, arg in enumerate(cmd):
+            if arg not in ("-y", "-i", "-f", "-safe", "-c", "-vf", "-r", "-t",
+                           "-c:v", "-preset", "-c:a", "-b:a", "-ar", "-ac",
+                           "ffmpeg", "concat", "0", "copy", "libx264", "fast",
+                           "aac", "192k", "44100", "2", "24", "null"):
+                path = Path(arg)
+                if path.suffix == ".mp4" and not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"\x00" * 100)
+        return MagicMock(returncode=0)
+
+    with patch("pipeline.assembler.subprocess.run", side_effect=_fake_ffmpeg), \
          patch("pipeline.assembler._audio_duration", return_value=7.5), \
          patch("pipeline.assembler._final_output_path", return_value=fake_output):
-        mock_run.return_value = MagicMock(returncode=0)
         result = assemble(manifest=manifest, workspace=workspace, output_dir=output_dir)
 
     assert result == fake_output
-    assert mock_run.call_count >= 2
+    assert result.exists()
 
 
 def test_assemble_raises_when_clip_missing(tmp_path):
