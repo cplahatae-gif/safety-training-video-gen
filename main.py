@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
+from rich.panel import Panel
 
 import config
 from models.scene_manifest import SceneManifest, SceneStatus
@@ -175,6 +176,8 @@ def _run_stages(
             if not result.passed:
                 _abort_or_continue(result.overall, 3)
 
+        _print_scenario_review(manifest)
+
     if manifest is None:
         manifest = _load_manifest(workspace)
 
@@ -186,6 +189,7 @@ def _run_stages(
             print_result(result)
             if not result.passed:
                 _abort_or_continue(result.overall, 4)
+        _print_image_review_gate(workspace)
 
     if start <= 5 <= end:
         console.rule("[bold]Stage 5: Video Generator[/bold]")
@@ -222,6 +226,67 @@ def _abort_or_continue(score: float, stage: int) -> None:
     ).strip().lower()
     if answer != "y":
         raise SystemExit(f"Aborted — Stage {stage} 점수 미달. --stage 2-{stage} 로 재실행하세요.")
+
+
+def _print_scenario_review(manifest: SceneManifest) -> None:
+    import os
+    console.rule("[bold cyan]시나리오 확인[/bold cyan]")
+    act_colors = {
+        "hook": "cyan", "conflict": "yellow", "consequence": "red",
+        "resolution": "green", "rules": "blue",
+    }
+    for scene in manifest.scenes:
+        color = act_colors.get(scene.act, "white")
+        narration = scene.narration_ko[:80] + ("…" if len(scene.narration_ko) > 80 else "")
+        image_desc = scene.image_prompt[scene.image_prompt.find("). ") + 3:][:70] if "). " in scene.image_prompt else scene.image_prompt[:70]
+        on_screen = scene.on_screen_text or "(없음)"
+        content = (
+            f"[dim]나레이션 :[/dim] {narration}\n"
+            f"[dim]화면 자막 :[/dim] {on_screen}\n"
+            f"[dim]이미지 설명:[/dim] {image_desc}…"
+        )
+        console.print(Panel(
+            content,
+            title=f"[bold {color}]{scene.scene_id} ({scene.act})[/bold {color}]  {scene.duration_sec}s",
+            border_style=color,
+            expand=False,
+        ))
+    console.print()
+    if os.environ.get("FORCE_RUN") == "1":
+        console.print("[dim]FORCE_RUN=1 -시나리오 확인 게이트 스킵[/dim]")
+        return
+    answer = input("위 시나리오로 이미지 생성을 시작할까요? [y/N] ").strip().lower()
+    if answer != "y":
+        raise SystemExit(
+            "Aborted — 시나리오 재생성 필요.\n"
+            "재실행: uv run python main.py --stage 2-3 --run-id <run_id>"
+        )
+
+
+def _print_image_review_gate(workspace: Path) -> None:
+    import os
+    images_dir = workspace / "images"
+    pngs = sorted(p for p in images_dir.glob("*.png") if not p.name.startswith("_"))
+    console.rule("[bold cyan]이미지 확인[/bold cyan]")
+    console.print(f"[green]이미지 생성 완료[/green] ({len(pngs)}개)")
+    console.print(f"[bold]폴더:[/bold] {images_dir.resolve()}")
+    console.print("[dim]파일 탐색기에서 열어서 아래 항목을 확인하세요:[/dim]")
+    console.print("  - 모든 씬에 동일한 장비가 있는가")
+    console.print("  - 분할화면/콜라주가 없는가")
+    console.print("  - 작업자 안전장비(안전모/조끼) 착용 여부")
+    console.print("  - consequence 씬: 폭발 없이 정적 위험 표현인가")
+    console.print("  - 캐릭터 복장이 전 씬에서 일관되는가")
+    console.print()
+    if os.environ.get("FORCE_RUN") == "1":
+        console.print("[dim]FORCE_RUN=1 -이미지 확인 게이트 스킵[/dim]")
+        return
+    answer = input("이미지 확인 후 영상 생성을 시작할까요? [y/N] ").strip().lower()
+    if answer != "y":
+        raise SystemExit(
+            "Aborted — 이미지 재생성이 필요하면:\n"
+            "  manifest.json에서 해당 씬 status를 'audio_ready'로 변경 후\n"
+            "  uv run python main.py --stage 4 --run-id <run_id>"
+        )
 
 
 _SUB_SCENE_RE = re.compile(r"^S\d+[a-z]$")
