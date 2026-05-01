@@ -17,6 +17,7 @@ from pipeline.script_gen import generate_script
 from pipeline.sop_parser import parse_sop, ParseError
 from pipeline.tts import synthesize
 from pipeline.video_gen import generate_videos
+from scripts.evaluate_video import evaluate as evaluate_video
 
 console = Console()
 
@@ -40,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Show manifest without generating media"
+    )
+    parser.add_argument(
+        "--evaluate", action="store_true",
+        help="Run auto-evaluation on the assembled video after Stage 7"
     )
     return parser
 
@@ -180,6 +185,9 @@ def _run_stages(
             output_dir=config.OUTPUT_DIR,
         )
         console.print(f"\n[bold green]Done! Output: {output_path}[/bold green]")
+        if args.evaluate:
+            console.rule("[bold]Auto-Evaluation[/bold]")
+            evaluate_video(output_path, workspace, config.OUTPUT_DIR)
 
 
 _SUB_SCENE_RE = re.compile(r"^S\d+[a-z]$")
