@@ -158,7 +158,8 @@ def _generate_ref_with_retry(prompt: str, ref_path: Path, out_path: Path, model:
                         "image_prompt_strength": 0.15,
                     },
                 )
-            data = output[0].read()
+            # flux-1.1-pro returns a single FileOutput, not a list
+            data = output.read() if hasattr(output, "read") else output[0].read()
             if not data:
                 raise ValueError(f"empty image response from {model}")
             out_path.write_bytes(data)
