@@ -32,7 +32,13 @@ def generate_images(manifest: SceneManifest, workspace: Path, domain: str = "ind
     (CharacterAgent) and uses pose-specific references per scene. This replaces
     the previous "first scene becomes ref" approach which had identity drift.
     Falls back to legacy behavior if sheet generation fails.
+
+    By default, ImageAgent (Vision self-critique loop) is used to evaluate
+    each generated image and retry with refined prompts. Set
+    DISABLE_IMAGE_AGENT=1 to skip the critique loop and use raw FLUX output.
     """
+    import os
+    use_image_agent = os.environ.get("DISABLE_IMAGE_AGENT") != "1"
     images_dir = workspace / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
@@ -109,7 +115,20 @@ def generate_images(manifest: SceneManifest, workspace: Path, domain: str = "ind
         else:
             scene_ref_path = ref_path  # legacy single-ref
 
-        if is_first_scene:
+        if use_image_agent and not is_first_scene and scene_ref_path:
+            # NEW PATH: ImageAgent with vision self-critique
+            from pipeline.agents.image_agent import ImageAgent
+            agent = ImageAgent(
+                scene={"scene_id": scene.scene_id, "act": scene.act, "image_prompt": scene.image_prompt},
+                equipment_type=equipment_hint,
+                domain=domain,
+                ref_path=scene_ref_path,
+            )
+            result = agent.run(out_path)
+            success = result.success
+            if not success:
+                console.print(f"[yellow]ImageAgent failed for {scene.scene_id}[/yellow]")
+        elif is_first_scene:
             # Legacy first-scene path (used only when character sheet unavailable)
             console.print(f"[dim]Generating reference image for {scene.scene_id} ({base_model})[/dim]")
             success = _generate_with_retry(scene.image_prompt, ref_path_candidate, base_model)
