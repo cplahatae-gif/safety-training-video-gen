@@ -18,6 +18,9 @@ from pipeline.sop_parser import parse_sop, ParseError
 from pipeline.tts import synthesize
 from pipeline.video_gen import generate_videos
 from scripts.evaluate_video import evaluate as evaluate_video
+from scripts.validate_stage import (
+    validate_stage3, validate_stage4, validate_stage5, print_result, PASS_THRESHOLD,
+)
 
 console = Console()
 
@@ -45,6 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--evaluate", action="store_true",
         help="Run auto-evaluation on the assembled video after Stage 7"
+    )
+    parser.add_argument(
+        "--validate", action="store_true",
+        help="Auto-validate output after stages 3, 4, 5 using Gemini; abort if score < 7"
     )
     return parser
 
@@ -162,16 +169,32 @@ def _run_stages(
             console.print(manifest.model_dump_json(indent=2))
             return
 
+        if getattr(args, "validate", False):
+            result = validate_stage3(workspace)
+            print_result(result)
+            if not result.passed:
+                _abort_or_continue(result.overall, 3)
+
     if manifest is None:
         manifest = _load_manifest(workspace)
 
     if start <= 4 <= end:
         console.rule("[bold]Stage 4: Image Generator[/bold]")
         manifest = generate_images(manifest=manifest, workspace=workspace)
+        if getattr(args, "validate", False):
+            result = validate_stage4(workspace)
+            print_result(result)
+            if not result.passed:
+                _abort_or_continue(result.overall, 4)
 
     if start <= 5 <= end:
         console.rule("[bold]Stage 5: Video Generator[/bold]")
         manifest = generate_videos(manifest=manifest, workspace=workspace)
+        if getattr(args, "validate", False):
+            result = validate_stage5(workspace)
+            print_result(result)
+            if not result.passed:
+                _abort_or_continue(result.overall, 5)
 
     if start <= 6 <= end:
         console.rule("[bold]Stage 6: TTS (fill gaps)[/bold]")
@@ -188,6 +211,17 @@ def _run_stages(
         if args.evaluate:
             console.rule("[bold]Auto-Evaluation[/bold]")
             evaluate_video(output_path, workspace, config.OUTPUT_DIR)
+
+
+def _abort_or_continue(score: float, stage: int) -> None:
+    import os
+    if os.environ.get("FORCE_RUN") == "1":
+        return
+    answer = input(
+        f"\nStage {stage} score {score:.1f}/10 (기준 {PASS_THRESHOLD}). 계속 진행? [y/N] "
+    ).strip().lower()
+    if answer != "y":
+        raise SystemExit(f"Aborted — Stage {stage} 점수 미달. --stage 2-{stage} 로 재실행하세요.")
 
 
 _SUB_SCENE_RE = re.compile(r"^S\d+[a-z]$")
