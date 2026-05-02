@@ -13,8 +13,10 @@ This module is mock-friendly: replicate.run + Gemini calls are the only external
 """
 from __future__ import annotations
 import base64
+import os
+import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -124,7 +126,10 @@ def _critique_image_with_vision(
     """Send the generated image to Gemini Vision for evaluation.
 
     Returns CritiqueResult with score = avg of per-metric scores.
-    On Gemini failure, returns a passing result (score=8) to avoid blocking.
+    On Gemini failure, fails closed (score=0, passed=False) so the
+    pipeline does not silently ship unreviewed images. Operators can set
+    ALLOW_CRITIQUE_FALLBACK=1 to revert to the old fail-open behavior
+    when Gemini is genuinely unavailable.
     """
     try:
         with open(image_path, "rb") as f:
@@ -158,9 +163,27 @@ def _critique_image_with_vision(
             critique.issues.append(str(result["main_issue"]))
         return critique
     except Exception as exc:
-        console.print(f"[yellow]Vision critique failed: {exc} — accepting image[/yellow]")
-        # Return a passing score so we don't block on Gemini issues
-        return CritiqueResult(score=8.0, issues=[], raw={}, passed=True)
+        if os.environ.get("ALLOW_CRITIQUE_FALLBACK") == "1":
+            console.print(
+                f"[yellow]Vision critique failed: {exc} — ALLOW_CRITIQUE_FALLBACK=1 set, "
+                f"accepting image[/yellow]"
+            )
+            return CritiqueResult(
+                score=8.0,
+                issues=[f"critique unavailable (fallback): {exc}"],
+                raw={},
+                passed=True,
+            )
+        console.print(
+            f"[red]Vision critique unavailable: {exc} — failing closed "
+            f"(set ALLOW_CRITIQUE_FALLBACK=1 to override)[/red]"
+        )
+        return CritiqueResult(
+            score=0.0,
+            issues=[f"critique unavailable: {exc}"],
+            raw={},
+            passed=False,
+        )
 
 
 # ─── Prompt refinement ────────────────────────────────────────────────────────
@@ -193,11 +216,21 @@ def _refine_prompt(original_prompt: str, issues: list[str]) -> str:
 
 @dataclass
 class ImageAgentResult:
+    """Result of one ImageAgent.run().
+
+    success — generation backend produced a file (no API outage).
+    passed  — quality gate cleared (final image score >= threshold).
+
+    Callers that decide whether to promote a scene to image_ready must check
+    `passed`, not `success`. `success=True, passed=False` means a file exists
+    on disk but did not clear vision critique — usually a signal to skip.
+    """
     success: bool
+    passed: bool
     score: float
     attempts: int
     final_prompt: str
-    issues: list[str]
+    issues: list[str] = field(default_factory=list)
 
 
 class ImageAgent:
@@ -241,27 +274,42 @@ class ImageAgent:
     # ─── Public entry ─────────────────────────────────────────────────────────
 
     def run(self, out_path: Path) -> ImageAgentResult:
-        """Generate-critique-refine loop. Returns best result."""
+        """Generate-critique-refine loop.
+
+        Each attempt writes to its own attempt-specific path so the best
+        scoring artifact is preserved even if a later retry scores worse.
+        At the end, the best attempt is copied to `out_path`.
+        """
         current_prompt = self.image_prompt
         best_score = -1.0
         best_attempts = 0
         best_issues: list[str] = []
+        best_path: Optional[Path] = None
+        best_prompt = current_prompt
+        attempt_paths: list[Path] = []
+        any_generation_ok = False
+
+        workdir = out_path.parent
+        stem = out_path.stem
 
         for attempt in range(1, self.max_attempts + 1):
-            # Generate
-            ok = self._generate_one(current_prompt, out_path)
+            attempt_path = workdir / f"{stem}.attempt{attempt}.png"
+            attempt_paths.append(attempt_path)
+
+            ok = self._generate_one(current_prompt, attempt_path)
             if not ok:
-                # Generation itself failed (API down / persistent throttle)
-                if attempt >= self.max_attempts:
+                if attempt >= self.max_attempts and not any_generation_ok:
+                    self._cleanup_attempts(attempt_paths, keep=None)
                     return ImageAgentResult(
-                        success=False, score=0.0, attempts=attempt,
-                        final_prompt=current_prompt, issues=["generation backend failed"],
+                        success=False, passed=False, score=0.0, attempts=attempt,
+                        final_prompt=current_prompt,
+                        issues=["generation backend failed"],
                     )
                 continue
+            any_generation_ok = True
 
-            # Critique
             critique = _critique_image_with_vision(
-                out_path,
+                attempt_path,
                 image_prompt=current_prompt,
                 act=self.act,
                 equipment_type=self.equipment_type,
@@ -275,23 +323,57 @@ class ImageAgent:
                 best_score = critique.score
                 best_attempts = attempt
                 best_issues = critique.issues
+                best_path = attempt_path
+                best_prompt = current_prompt
 
             if critique.passed:
+                # Promote this attempt's file to the canonical out_path
+                self._promote(attempt_path, out_path)
+                self._cleanup_attempts(attempt_paths, keep=out_path)
                 return ImageAgentResult(
-                    success=True, score=critique.score, attempts=attempt,
-                    final_prompt=current_prompt, issues=critique.issues,
+                    success=True, passed=True, score=critique.score,
+                    attempts=attempt, final_prompt=current_prompt,
+                    issues=critique.issues,
                 )
 
-            # Below threshold and we have attempts left → refine
+            # Below threshold; refine and retry if attempts remain
             if attempt < self.max_attempts:
                 current_prompt = _refine_prompt(current_prompt, critique.issues)
                 console.print(f"[dim]{self.scene_id}: refining prompt for retry[/dim]")
 
-        # All attempts exhausted; return best (file already exists from last attempt or best one)
+        # All attempts exhausted, none passed. Promote the best one anyway
+        # so downstream stages have a file, but report passed=False so the
+        # caller can decide to skip / human-review.
+        if best_path and best_path.exists():
+            self._promote(best_path, out_path)
+        self._cleanup_attempts(attempt_paths, keep=out_path)
+
         return ImageAgentResult(
-            success=best_score > 0,
+            success=any_generation_ok,
+            passed=False,
             score=max(best_score, 0.0),
             attempts=best_attempts or self.max_attempts,
-            final_prompt=current_prompt,
+            final_prompt=best_prompt,
             issues=best_issues,
         )
+
+    @staticmethod
+    def _promote(src: Path, dst: Path) -> None:
+        """Copy `src` to `dst`, overwriting if needed."""
+        if src == dst or not src.exists():
+            return
+        shutil.copy2(src, dst)
+
+    @staticmethod
+    def _cleanup_attempts(paths: list[Path], keep: Optional[Path]) -> None:
+        """Delete attempt-specific files, except `keep` (usually the canonical out_path)."""
+        keep_resolved = keep.resolve() if keep else None
+        for p in paths:
+            try:
+                if not p.exists():
+                    continue
+                if keep_resolved and p.resolve() == keep_resolved:
+                    continue
+                p.unlink()
+            except Exception:
+                pass

@@ -6,6 +6,13 @@ from pipeline.image_gen import generate_images
 from models.scene_manifest import Scene, SceneManifest, SceneStatus
 
 
+_PASSING_CRITIQUE = {
+    "anatomy": 9, "domain_match": 9, "no_split_screen": 10,
+    "equipment_match": 9, "composition": 9,
+    "main_issue": None, "retry_hint": None,
+}
+
+
 @pytest.fixture(autouse=True)
 def _disable_character_sheet_by_default(monkeypatch, request):
     """Default: tests skip character sheet (legacy ref path).
@@ -14,6 +21,26 @@ def _disable_character_sheet_by_default(monkeypatch, request):
     if "use_sheet" in request.keywords:
         return  # marker overrides the default
     monkeypatch.setenv("DISABLE_CHARACTER_SHEET", "1")
+
+
+@pytest.fixture(autouse=True)
+def _mock_image_agent_gemini(request):
+    """Mock the ImageAgent's Gemini Vision so tests don't hit the real API.
+
+    Returns a passing critique by default. Tests that need a different
+    critique result should patch `pipeline.agents.image_agent.gemini_client`
+    themselves (the inner patch wins).
+    """
+    if "no_image_agent_gemini_mock" in request.keywords:
+        yield
+        return
+    fake_response = MagicMock()
+    fake_response.text = json.dumps(_PASSING_CRITIQUE)
+    with patch("pipeline.agents.image_agent.gemini_client") as mc:
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = fake_response
+        mc.return_value = mock_client
+        yield
 
 
 def _make_manifest(tmp_path: Path) -> SceneManifest:

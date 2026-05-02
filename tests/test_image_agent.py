@@ -90,8 +90,14 @@ def test_critique_with_vision_fails_for_broken_anatomy(tmp_path):
     assert any("neck" in issue.lower() for issue in result.issues)
 
 
-def test_critique_handles_gemini_failure_gracefully(tmp_path):
-    """If Gemini errors, critique returns a passing score (don't block)."""
+def test_critique_fails_closed_on_gemini_error(tmp_path, monkeypatch):
+    """If Gemini errors, critique fails closed (don't ship unreviewed images).
+
+    This is a regression guard for an earlier fail-open behavior that silently
+    accepted any image when the vision evaluator was down — defeating the
+    purpose of the self-critique loop under degraded dependencies.
+    """
+    monkeypatch.delenv("ALLOW_CRITIQUE_FALLBACK", raising=False)
     img = _make_fake_image(tmp_path)
 
     with patch("pipeline.agents.image_agent.gemini_client") as mock_client_factory:
@@ -103,8 +109,25 @@ def test_critique_handles_gemini_failure_gracefully(tmp_path):
             equipment_type="x",
             domain="lab",
         )
+    assert not result.passed
+    assert result.score == 0.0
+    assert any("critique unavailable" in i for i in result.issues)
+
+
+def test_critique_fails_open_when_fallback_env_set(tmp_path, monkeypatch):
+    """ALLOW_CRITIQUE_FALLBACK=1 reverts to fail-open for emergencies."""
+    monkeypatch.setenv("ALLOW_CRITIQUE_FALLBACK", "1")
+    img = _make_fake_image(tmp_path)
+
+    with patch("pipeline.agents.image_agent.gemini_client") as mock_client_factory:
+        mock_client_factory.side_effect = RuntimeError("Gemini down")
+        result = _critique_image_with_vision(
+            img,
+            image_prompt="x", act="hook", equipment_type="x", domain="lab",
+        )
     assert result.passed
     assert result.score >= 7.0
+    assert any("fallback" in i for i in result.issues)
 
 
 def test_critique_returns_zero_when_image_unreadable(tmp_path):
@@ -198,8 +221,11 @@ def test_image_agent_passes_on_first_attempt(tmp_path):
         result = agent.run(out)
 
     assert result.success
+    assert result.passed
     assert result.attempts == 1
     assert out.exists()
+    # Attempt-specific files must not leak into the workspace
+    assert not (tmp_path / "out.attempt1.png").exists()
 
 
 def test_image_agent_refines_on_low_score(tmp_path):
@@ -238,6 +264,7 @@ def test_image_agent_refines_on_low_score(tmp_path):
 
     assert result.attempts == 2
     assert result.success  # second attempt passes
+    assert result.passed
 
 
 def test_image_agent_returns_best_after_all_fail(tmp_path):
@@ -265,8 +292,13 @@ def test_image_agent_returns_best_after_all_fail(tmp_path):
     assert mock_replicate.call_count == 2
     # Score below threshold
     assert result.score < 7.0
-    # File still exists from last attempt
+    # Quality gate must report not-passed so callers can skip the scene
+    assert not result.passed
+    # File still exists (best of attempts) so downstream stages have something
     assert out.exists()
+    # Attempt-specific files must be cleaned up
+    assert not (tmp_path / "out.attempt1.png").exists()
+    assert not (tmp_path / "out.attempt2.png").exists()
 
 
 def test_image_agent_falls_back_to_schnell_on_ref_failure(tmp_path):
@@ -303,3 +335,87 @@ def test_image_agent_falls_back_to_schnell_on_ref_failure(tmp_path):
 
     # Should have at least tried both paths
     assert call_count["i"] >= 2
+
+
+def test_image_agent_keeps_best_attempt_when_later_attempt_is_worse(tmp_path):
+    """When attempt 1 scores higher than attempt 2 (both failing), the file
+    on disk must match the higher-scoring attempt — not the last write."""
+    ref = _make_fake_image(tmp_path)
+    out = tmp_path / "out.png"
+
+    # Two distinct image bytes so we can verify which one is kept
+    bytes_attempt1 = b"\x89PNG\r\n\x1a\n" + b"\x01" * 200
+    bytes_attempt2 = b"\x89PNG\r\n\x1a\n" + b"\x02" * 200
+
+    fake1 = MagicMock(); fake1.read.return_value = bytes_attempt1
+    fake2 = MagicMock(); fake2.read.return_value = bytes_attempt2
+
+    rep_calls = {"i": 0}
+    def _replicate(model, **kwargs):
+        rep_calls["i"] += 1
+        # flux-1.1-pro returns single FileOutput on attempt 1, then attempt 2
+        return fake1 if rep_calls["i"] == 1 else fake2
+
+    # Attempt 1: score 6.0 (fail), Attempt 2: score 4.0 (fail and worse)
+    crit_high = {"anatomy": 6, "domain_match": 6, "no_split_screen": 6,
+                 "equipment_match": 6, "composition": 6, "main_issue": "x", "retry_hint": "y"}
+    crit_low = {"anatomy": 4, "domain_match": 4, "no_split_screen": 4,
+                "equipment_match": 4, "composition": 4, "main_issue": "x", "retry_hint": "y"}
+    crit_responses = [MagicMock(text=json.dumps(crit_high)),
+                      MagicMock(text=json.dumps(crit_low))]
+    crit_idx = {"i": 0}
+    def _gemini(*args, **kwargs):
+        i = crit_idx["i"]; crit_idx["i"] += 1
+        return crit_responses[min(i, len(crit_responses) - 1)]
+
+    refine_response = json.dumps({"refined_prompt": "refined prompt with extra detail",
+                                  "what_changed": "x"})
+    scene = {"scene_id": "S01", "act": "hook", "image_prompt": "lab"}
+
+    with patch("pipeline.agents.image_agent.replicate.run", side_effect=_replicate), \
+         patch("pipeline.agents.image_agent.gemini_client") as mc, \
+         patch("pipeline.agents.image_agent.call_gemini_with_retry", return_value=refine_response):
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = _gemini
+        mc.return_value = mock_client
+        agent = ImageAgent(scene, equipment_type="laser", domain="lab",
+                           ref_path=ref, max_attempts=2)
+        result = agent.run(out)
+
+    # Both attempts failed quality gate
+    assert not result.passed
+    # The reported best score must be the higher one (attempt 1)
+    assert result.score == pytest.approx(6.0)
+    assert result.attempts == 1  # best attempt was attempt 1
+    # The file on disk must be attempt 1's bytes, NOT attempt 2's last-write
+    assert out.read_bytes() == bytes_attempt1
+
+
+def test_image_agent_reports_passed_false_when_score_below_threshold(tmp_path):
+    """Even if generation succeeds, low score must mean passed=False."""
+    ref = _make_fake_image(tmp_path)
+    out = tmp_path / "out.png"
+    fake = MagicMock()
+    fake.read.return_value = b"\x89PNG\r\n\x1a\n" + b"\x00" * 200
+    crit_fail = {"anatomy": 5, "domain_match": 5, "no_split_screen": 5,
+                 "equipment_match": 5, "composition": 5,
+                 "main_issue": "weak", "retry_hint": "improve"}
+    fake_response = MagicMock(text=json.dumps(crit_fail))
+    refine_response = json.dumps({"refined_prompt": "improved prompt with more detail",
+                                  "what_changed": "x"})
+    scene = {"scene_id": "S01", "act": "hook", "image_prompt": "lab"}
+
+    with patch("pipeline.agents.image_agent.replicate.run", return_value=fake), \
+         patch("pipeline.agents.image_agent.gemini_client") as mc, \
+         patch("pipeline.agents.image_agent.call_gemini_with_retry", return_value=refine_response):
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = fake_response
+        mc.return_value = mock_client
+        agent = ImageAgent(scene, equipment_type="laser", domain="lab",
+                           ref_path=ref, max_attempts=2)
+        result = agent.run(out)
+
+    assert result.success  # generation worked
+    assert not result.passed  # but quality threshold not met
+    assert result.score == pytest.approx(5.0)
+    assert out.exists()

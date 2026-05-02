@@ -130,6 +130,7 @@ def dry_run_image_agent():
             result = agent.run(out)
 
         assert result.success
+        assert result.passed
         assert result.score >= 7.0
     console.print("[green]PASS[/green] ImageAgent dry-run")
 

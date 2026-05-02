@@ -116,7 +116,10 @@ def generate_images(manifest: SceneManifest, workspace: Path, domain: str = "ind
             scene_ref_path = ref_path  # legacy single-ref
 
         if use_image_agent and not is_first_scene and scene_ref_path:
-            # NEW PATH: ImageAgent with vision self-critique
+            # NEW PATH: ImageAgent with vision self-critique.
+            # Quality gate: only mark image_ready when result.passed (score >= threshold).
+            # success=True/passed=False means a file exists but did not clear vision
+            # critique — skip so it does not advance to Stage 5 ($0.50/clip).
             from pipeline.agents.image_agent import ImageAgent
             agent = ImageAgent(
                 scene={"scene_id": scene.scene_id, "act": scene.act, "image_prompt": scene.image_prompt},
@@ -125,9 +128,15 @@ def generate_images(manifest: SceneManifest, workspace: Path, domain: str = "ind
                 ref_path=scene_ref_path,
             )
             result = agent.run(out_path)
-            success = result.success
-            if not success:
-                console.print(f"[yellow]ImageAgent failed for {scene.scene_id}[/yellow]")
+            success = result.success and result.passed
+            if not result.success:
+                console.print(f"[red]ImageAgent generation failed for {scene.scene_id}[/red]")
+            elif not result.passed:
+                issues_str = "; ".join(result.issues[:2]) if result.issues else "score below threshold"
+                console.print(
+                    f"[yellow]ImageAgent: {scene.scene_id} below quality threshold "
+                    f"(score {result.score:.1f}/10, attempts {result.attempts}) — {issues_str}[/yellow]"
+                )
         elif is_first_scene:
             # Legacy first-scene path (used only when character sheet unavailable)
             console.print(f"[dim]Generating reference image for {scene.scene_id} ({base_model})[/dim]")
