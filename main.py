@@ -104,6 +104,19 @@ def main() -> None:
 
     if args.stage:
         start, end = parse_stage_range(args.stage)
+        # Stage 1 starts fresh from --sop: create a new workspace, no run-id prompt.
+        if start == 1 and args.sop:
+            sop_path = Path(args.sop)
+            if not sop_path.exists():
+                console.print(f"[red]SOP file not found: {sop_path}[/red]")
+                sys.exit(1)
+            run_id = args.run_id or datetime.now().strftime("%Y%m%d-%H%M%S")
+            workspace = config.WORKSPACE_DIR / run_id
+            workspace.mkdir(parents=True, exist_ok=True)
+            config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            console.print(f"[bold green]Run ID: {run_id}[/bold green]")
+            _run_stages(start, end, sop_path=sop_path, workspace=workspace, args=args)
+            return
         run_id = _resolve_run_id(args.run_id)
         workspace = config.WORKSPACE_DIR / run_id
         manifest = _load_manifest(workspace)
@@ -152,7 +165,8 @@ def _run_stages(
     script: list[dict] | None = None
     if start <= 2 <= end:
         console.rule("[bold]Stage 2: Script Generator[/bold]")
-        script = generate_script(sop=sop, duration=args.duration)
+        script = generate_script(sop=sop, duration=args.duration, workspace=workspace)
+        _print_treatment_review_gate(workspace)
 
     if start <= 3 <= end:
         console.rule("[bold]Stage 3: Scene Splitter (+ TTS)[/bold]")
@@ -265,6 +279,39 @@ def _print_scenario_review(manifest: SceneManifest) -> None:
     if answer != "y":
         raise SystemExit(
             "Aborted — 시나리오 재생성 필요.\n"
+            "재실행: uv run python main.py --stage 2-3 --run-id <run_id>"
+        )
+
+
+def _print_treatment_review_gate(workspace: Path) -> None:
+    """After Stage 2: pause to let the human review the prose treatment.
+
+    The treatment is the source-of-truth scenario document — scenes are derived
+    from it. Catching a bad treatment here saves regenerating scene cards.
+    """
+    import os
+    treatment_path = workspace / "treatment.md"
+    if not treatment_path.exists():
+        # Older runs / legacy path may not produce a treatment file. Skip silently.
+        return
+    chars = len(treatment_path.read_text(encoding="utf-8"))
+    console.rule("[bold cyan]트리트먼트 확인[/bold cyan]")
+    console.print(f"[green]트리트먼트 생성 완료[/green] ({chars:,}자)")
+    console.print(f"[bold]파일:[/bold] {treatment_path.resolve()}")
+    console.print("[dim]에디터로 열어서 아래 항목을 확인하세요:[/dim]")
+    console.print("  - 5막(hook/conflict/consequence/resolution/rules) 모두 있는가")
+    console.print("  - 도메인/장비/구체 수치가 정확히 인용됐는가")
+    console.print("  - consequence가 폭발/유리파편 같은 자극적 묘사 없이 정적 표현인가")
+    console.print("  - resolution 비중이 가장 큰가")
+    console.print("  - 각 막의 BGM 키워드가 명시됐는가")
+    console.print()
+    if os.environ.get("FORCE_RUN") == "1":
+        console.print("[dim]FORCE_RUN=1 - 트리트먼트 게이트 스킵[/dim]")
+        return
+    answer = input("이 트리트먼트로 씬 분해를 진행할까요? [y/N] ").strip().lower()
+    if answer != "y":
+        raise SystemExit(
+            "Aborted — 트리트먼트 재생성 필요.\n"
             "재실행: uv run python main.py --stage 2-3 --run-id <run_id>"
         )
 

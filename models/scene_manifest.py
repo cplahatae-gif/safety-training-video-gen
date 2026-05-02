@@ -31,12 +31,15 @@ class Scene(BaseModel):
     act: str = Field(pattern=_ACT_PATTERN)
     duration_sec: int
     status: SceneStatus = SceneStatus.pending
-    narration_ko: str
+    narration_ko: str = ""
     image_prompt: str
     motion_prompt: str
     camera: str
     mood: str
     on_screen_text: Optional[str] = None
+    # BGM search keywords for this scene's tone (royalty-free library lookup).
+    # Defaults to empty list for backwards compat with older manifests.
+    bgm_keywords: list[str] = []
 
 
 class SceneManifest(BaseModel):

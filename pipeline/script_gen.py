@@ -6,6 +6,8 @@ Set USE_LEGACY_SCRIPT=1 to use the original one-shot Gemini call.
 from __future__ import annotations
 import json
 import os
+from pathlib import Path
+from typing import Optional
 
 from google import genai
 from google.genai import types
@@ -24,14 +26,20 @@ class ScriptError(RuntimeError):
     pass
 
 
-def generate_script(sop: dict, duration: int) -> list[dict]:
-    """Generate scene list from SOP. Routes to ScenarioAgent unless USE_LEGACY_SCRIPT=1."""
+def generate_script(
+    sop: dict, duration: int, workspace: Optional[Path] = None
+) -> list[dict]:
+    """Generate scene list from SOP. Routes to ScenarioAgent unless USE_LEGACY_SCRIPT=1.
+
+    If `workspace` is provided and the new agent path is used, the agent saves
+    treatment.md there for human review.
+    """
     if os.environ.get("USE_LEGACY_SCRIPT") == "1":
         return _generate_script_legacy(sop, duration)
 
     # Default: new agent-based path
     from pipeline.agents.scenario_agent import generate_script_v2
-    return generate_script_v2(sop, duration)
+    return generate_script_v2(sop, duration, workspace=workspace)
 
 
 # ─── Legacy implementation (kept for backwards compat / testing) ─────────────

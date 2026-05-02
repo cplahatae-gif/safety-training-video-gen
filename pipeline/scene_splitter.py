@@ -4,9 +4,13 @@ import math
 import subprocess
 from pathlib import Path
 
+from rich.console import Console
+
 from models.scene_manifest import Scene, SceneManifest, SceneStatus
 from pipeline.tts import synthesize
 from prompts.scene_prompt import build_image_prompt
+
+console = Console()
 
 DEFAULT_PROVIDER = "google"
 DEFAULT_VOICE = "ko-KR-Wavenet-B"
@@ -35,24 +39,34 @@ def split_scenes(
     scenes: list[Scene] = []
 
     for raw in script:
-        scene_id = raw["scene_id"]
-        narration = raw["narration_ko"]
-        provider = tts_provider or DEFAULT_PROVIDER
-        voice = tts_voice or DEFAULT_VOICE
-
-        audio_path = audio_dir / f"{scene_id}.wav"
-        _, dur_sec = synthesize(
-            text=narration,
-            provider=provider,
-            voice=voice,
-            output_path=audio_path,
-        )
-
-        if tts_provider is None:
-            tts_provider = provider
-            tts_voice = voice
-
-        duration_sec = math.ceil(dur_sec)
+        scene_id = raw.get("scene_id") or f"S{len(scenes)+1:02d}"
+        narration = raw.get("narration_ko") or ""
+        # Determine duration:
+        # - If narration is non-empty: synthesize TTS, derive duration from audio.
+        # - If narration is empty: use the script's duration_sec field (set by ScenarioAgent),
+        #   skip TTS, and emit a silent placeholder wav for downstream stages.
+        if narration:
+            provider = tts_provider or DEFAULT_PROVIDER
+            voice = tts_voice or DEFAULT_VOICE
+            audio_path = audio_dir / f"{scene_id}.wav"
+            _, dur_sec = synthesize(
+                text=narration,
+                provider=provider,
+                voice=voice,
+                output_path=audio_path,
+            )
+            if tts_provider is None:
+                tts_provider = provider
+                tts_voice = voice
+            duration_sec = math.ceil(dur_sec)
+        else:
+            duration_sec = int(raw.get("duration_sec") or 5)
+            duration_sec = max(1, min(KLING_MAX_DUR, duration_sec))
+            audio_path = audio_dir / f"{scene_id}.wav"
+            _write_silent_wav(audio_path, duration_sec)
+            console.print(
+                f"[dim]{scene_id}: silent placeholder ({duration_sec}s, no narration)[/dim]"
+            )
 
         if duration_sec <= KLING_MAX_DUR:
             scenes.append(_make_scene(raw, scene_id, duration_sec, equipment_type, domain))
@@ -90,17 +104,21 @@ def split_scenes(
 
 
 def _make_scene(raw: dict, scene_id: str, duration_sec: int, equipment_type: str, domain: str = "industrial") -> Scene:
+    bgm = raw.get("bgm_keywords") or []
+    if not isinstance(bgm, list):
+        bgm = []
     return Scene(
         scene_id=scene_id,
         act=raw["act"],
         duration_sec=duration_sec,
         status=SceneStatus.audio_ready,
-        narration_ko=raw["narration_ko"],
+        narration_ko=raw.get("narration_ko") or "",
         image_prompt=build_image_prompt(raw["image_prompt"], equipment=equipment_type, domain=domain),
         motion_prompt=raw["motion_prompt"],
         camera=raw["camera"],
         mood=raw["mood"],
         on_screen_text=raw.get("on_screen_text"),
+        bgm_keywords=[str(k) for k in bgm],
     )
 
 
@@ -111,4 +129,16 @@ def _split_audio_file(
     if length is not None:
         cmd += ["-t", str(length)]
     cmd += ["-acodec", "copy", str(dest)]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def _write_silent_wav(out_path: Path, duration_sec: int) -> None:
+    """Create a silent stereo wav of given duration. Used when no narration is set."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"anullsrc=channel_layout=mono:sample_rate=44100",
+        "-t", str(duration_sec),
+        "-acodec", "pcm_s16le",
+        str(out_path),
+    ]
     subprocess.run(cmd, check=True, capture_output=True)
