@@ -69,16 +69,22 @@ def get_character_prefix(domain: str) -> str:
     return CHARACTER_PROMPTS.get(domain, CHARACTER_PROMPTS["general"])
 
 
-def build_character_sheet_prompt(domain: str, pose: dict, environment_hint: str = "") -> str:
+def build_character_sheet_prompt(
+    domain: str,
+    pose: dict,
+    environment_hint: str = "",
+    ref_desc: str = "",
+) -> str:
     """Build a FLUX prompt for one pose in the character reference sheet.
 
-    Reference sheets are generated against a clean studio background to
-    isolate character identity (matches arxiv 2512.16954 base identity pattern).
+    ref_desc: optional text description derived from user reference images,
+    prepended to lock in character appearance.
     """
     prefix = get_character_prefix(domain)
     bg = environment_hint or "clean neutral studio background, soft lighting"
+    ref_part = f"{ref_desc}" if ref_desc else ""
     return (
-        f"{prefix}"
+        f"{ref_part}{prefix}"
         f"{pose['description']}, "
         f"photorealistic portrait, sharp facial features, "
         f"single person, {bg}, single continuous shot, no text overlays"

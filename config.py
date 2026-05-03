@@ -39,3 +39,7 @@ OUTRO_IMAGE: str = os.getenv("OUTRO_IMAGE", "")
 OUTRO_NARRATION: str = os.getenv("OUTRO_NARRATION", "")
 OUTRO_TTS_PROVIDER: str = os.getenv("OUTRO_TTS_PROVIDER", "google")
 OUTRO_TTS_VOICE: str = os.getenv("OUTRO_TTS_VOICE", "ko-KR-Wavenet-B")
+
+# Reference images — place person.jpg / uniform.jpg / equipment.jpg here
+BASE_DIR: Path = Path(__file__).parent
+REFERENCE_DIR: Path = Path(os.getenv("REFERENCE_DIR", str(BASE_DIR / "samples" / "references")))

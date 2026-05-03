@@ -52,6 +52,22 @@ def generate_images(manifest: SceneManifest, workspace: Path, domain: str = "ind
     # Track first-generated image per parent group for sub-scene reuse
     parent_images: dict[str, Path] = {}
 
+    # Load user-provided reference images (samples/references/)
+    references = None
+    ref_prompt_prefix = ""
+    try:
+        from pipeline.agents.reference_loader import load_references
+        references = load_references()
+        if references.has_references:
+            ref_prompt_prefix = references.prompt_prefix()
+            console.print(
+                f"[green]Reference images: {', '.join(references.paths.keys())}[/green]"
+            )
+            if ref_prompt_prefix:
+                console.print(f"[dim]Prompt prefix: {ref_prompt_prefix[:80]}...[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]Reference load failed: {exc}[/yellow]")
+
     # Try to generate a character reference sheet (Identity Anchoring)
     # If sheet generation fails, fall back to legacy single-ref behavior.
     character_sheet: dict = {}
@@ -60,7 +76,12 @@ def generate_images(manifest: SceneManifest, workspace: Path, domain: str = "ind
         import os
         if os.environ.get("DISABLE_CHARACTER_SHEET") != "1":
             from pipeline.agents.character_agent import CharacterAgent
-            agent = CharacterAgent(domain=domain, workspace=workspace, equipment_hint=equipment_hint)
+            agent = CharacterAgent(
+                domain=domain,
+                workspace=workspace,
+                equipment_hint=equipment_hint,
+                references=references,
+            )
             character_sheet = agent.prepare()
             if character_sheet:
                 use_sheet = True
@@ -117,12 +138,14 @@ def generate_images(manifest: SceneManifest, workspace: Path, domain: str = "ind
 
         if use_image_agent and not is_first_scene and scene_ref_path:
             # NEW PATH: ImageAgent with vision self-critique.
-            # Quality gate: only mark image_ready when result.passed (score >= threshold).
-            # success=True/passed=False means a file exists but did not clear vision
-            # critique — skip so it does not advance to Stage 5 ($0.50/clip).
+            # Prepend reference description to scene prompt for Option C consistency.
+            scene_prompt = (
+                ref_prompt_prefix + scene.image_prompt
+                if ref_prompt_prefix else scene.image_prompt
+            )
             from pipeline.agents.image_agent import ImageAgent
             agent = ImageAgent(
-                scene={"scene_id": scene.scene_id, "act": scene.act, "image_prompt": scene.image_prompt},
+                scene={"scene_id": scene.scene_id, "act": scene.act, "image_prompt": scene_prompt},
                 equipment_type=equipment_hint,
                 domain=domain,
                 ref_path=scene_ref_path,
