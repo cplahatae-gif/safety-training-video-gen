@@ -1,22 +1,5 @@
 # Safety Training Video Generator
 
-<!-- PUBLIC-PURPOSE-INTRO:START -->
-
-## 왜 이 프로젝트가 중요한가
-
-산업현장의 안전교육은 형식적 시청 시간이 아니라 사고를 줄이기 위한 전달 체계여야 합니다. 이 프로젝트는 SOP와 작업표준 문서를 교육 영상으로 전환해, 현장 근로자가 이해하기 쉬운 방식으로 위험요인과 예방 행동을 반복 학습할 수 있게 만드는 것을 목표로 합니다.
-
-## 기술적으로 무엇을 보여주는가
-
-Python 파이프라인과 Remotion 기반 영상 생성 흐름을 통해 문서 입력, 스크립트 구성, 장면 설계, 렌더링을 자동화합니다. SOP의 구조를 보존하면서 교육 메시지와 시각 자료를 분리해 관리할 수 있도록 설계되었습니다.
-
-## 공개 저장소로서의 의미
-
-기술의 목적은 영상을 더 빨리 만드는 데 그치지 않습니다. 중요한 안전 지식을 누락 없이 전달하고, 사업장별 교육 품질의 편차를 줄이는 데 있습니다.
-
-<!-- PUBLIC-PURPOSE-INTRO:END -->
-
-
 Pipeline for turning SOP documents into short safety-training video assets.
 
 The project parses a safety procedure document, creates a training script,
