@@ -1,5 +1,22 @@
 # Safety Training Video Generator
 
+<!-- PROJECT-INTRO:START -->
+
+## 프로젝트가 중요한 이유
+
+안전교육은 법정 시간을 채우는 절차가 아니라 현장의 사고를 줄이기 위한 지식 전달 체계입니다. 이 프로젝트는 SOP와 작업표준 문서를 짧고 이해 가능한 교육 영상으로 바꾸어, 현장 작업자가 위험요인과 예방 행동을 반복적으로 학습할 수 있도록 돕습니다.
+
+## 기술적으로 보여주는 것
+
+Python 파이프라인으로 SOP 파싱, 교육 스크립트 생성, 장면 분할, 이미지·영상·음성 생성, 자막과 최종 조립까지 단계화합니다. Gemini 기반 검증과 stage-by-stage rerun 구조를 통해 생성형 AI 결과물을 한 번에 믿지 않고, 각 중간 산출물을 검토 가능한 단위로 관리합니다.
+
+## 공개 프로젝트로서의 의미
+
+기술적으로는 문서 처리, 생성형 AI, TTS, 영상 조립을 연결한 멀티모달 자동화이며, 사회적으로는 안전 지식의 전달 품질을 높이고 교육 편차를 줄이기 위한 시도입니다.
+
+<!-- PROJECT-INTRO:END -->
+
+
 Pipeline for turning SOP documents into short safety-training video assets.
 
 The project parses a safety procedure document, creates a training script,
